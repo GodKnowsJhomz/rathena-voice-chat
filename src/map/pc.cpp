@@ -63,6 +63,7 @@
 #include "storage.hpp"
 #include "unit.hpp" // unit_stop_attack(), unit_stop_walking()
 #include "vending.hpp" // struct s_vending
+#include "voice_bridge.hpp"
 
 using namespace rathena;
 
@@ -2302,6 +2303,7 @@ bool pc_authok(map_session_data *sd, uint32 login_id2, time_t expiration_time, i
 
 	// Request all registries (auth is considered completed whence they arrive)
 	intif_request_registry(sd,7);
+	voice_bridge_send_map_pos(sd);
 	return true;
 }
 

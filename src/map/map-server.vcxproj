@@ -242,6 +242,7 @@
     <ClInclude Include="storage.hpp" />
     <ClInclude Include="trade.hpp" />
     <ClInclude Include="unit.hpp" />
+    <ClInclude Include="voice_bridge.hpp" />
     <ClInclude Include="vending.hpp" />
   </ItemGroup>
   <ItemGroup>
@@ -1534,6 +1535,7 @@
     <ClCompile Include="storage.cpp" />
     <ClCompile Include="trade.cpp" />
     <ClCompile Include="unit.cpp" />
+    <ClCompile Include="voice_bridge.cpp" />
     <ClCompile Include="vending.cpp" />
   </ItemGroup>
   <ItemGroup>
