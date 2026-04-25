@@ -1129,6 +1129,17 @@ static void udp_position_loop() {
         s->war_map  = new_war_map;
         s->last_position_ms = tick_ms();
 
+        // Push own position back to the DLL so it can do stereo panning
+        // without needing to read memory offsets for CHAR_X / CHAR_Y.
+        if (s->authed) {
+            send_json_deferred(s, json{
+                {"type", "your_pos"},
+                {"x",    new_x},
+                {"y",    new_y},
+                {"map",  new_map}
+            });
+        }
+
         // Refresh party/guild from DB periodically
         time_t now_t = time(nullptr);
         if (now_t - s->db_refresh_tick >= g_cfg.db_refresh_s) {
