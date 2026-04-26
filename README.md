@@ -96,7 +96,7 @@ Players within range on the same map hear each other automatically. Moving away 
 
    **AlmaLinux / Rocky / RHEL / CentOS:**
    ```bash
-   sudo dnf install libuv-devel mysql-devel zlib-devel
+   sudo dnf config-manager --enable crb && sudo dnf install libuv-devel
    ```
 
 2. Build:
