@@ -1109,7 +1109,8 @@ static void udp_position_loop() {
         const int new_gid   = j.value("group_id", 0);
         const bool new_war_map = j.value("war_map", false);
 
-        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+        // Use unique_lock (not lock_guard) so we can unlock before the DB call below.
+        std::unique_lock<std::shared_mutex> lock(g_session_mtx);
         auto it = g_by_char_id.find(char_id);
         if (it == g_by_char_id.end() || !it->second) {
             // Session not yet created — cache position for when auth arrives
@@ -1140,21 +1141,35 @@ static void udp_position_loop() {
             });
         }
 
-        // Refresh party/guild from DB periodically
+        // DB refresh — snapshot char_id and bump tick NOW (under lock) so rapid
+        // back-to-back map_pos bursts for the same player don't all fire simultaneous
+        // queries. Then release the exclusive lock BEFORE the blocking MySQL call
+        // so audio-routing threads (shared_lock readers) are never stalled waiting
+        // for a DB round-trip that can easily take 5-50 ms.
         time_t now_t = time(nullptr);
-        if (now_t - s->db_refresh_tick >= g_cfg.db_refresh_s) {
-            CharInfo ci = db_get_char_info(s->char_id);
+        bool need_refresh = (now_t - s->db_refresh_tick >= g_cfg.db_refresh_s);
+        const int refresh_char_id = s->char_id;
+        if (need_refresh)
+            s->db_refresh_tick = now_t;  // prevent duplicate queries while lock is released
+        maybe_send_war_state_locked(s);
+        lock.unlock();  // release exclusive lock before blocking DB call
+
+        if (need_refresh) {
+            CharInfo ci = db_get_char_info(refresh_char_id);  // no lock held here
             if (ci.ok) {
-                if (ci.party_id != s->party_id || ci.guild_id != s->guild_id) {
-                    LOG_DEBUG("DB refresh char_id=%d party %d->%d guild %d->%d",
-                              s->char_id, s->party_id, ci.party_id, s->guild_id, ci.guild_id);
-                    idx_set_party(s, ci.party_id);  // keeps g_by_party in sync
-                    idx_set_guild(s, ci.guild_id);  // keeps g_by_guild in sync
+                std::lock_guard<std::shared_mutex> lock2(g_session_mtx);
+                auto it2 = g_by_char_id.find(refresh_char_id);
+                if (it2 != g_by_char_id.end() && it2->second) {
+                    ClientSession* s2 = it2->second;
+                    if (ci.party_id != s2->party_id || ci.guild_id != s2->guild_id) {
+                        LOG_DEBUG("DB refresh char_id=%d party %d->%d guild %d->%d",
+                                  refresh_char_id, s2->party_id, ci.party_id, s2->guild_id, ci.guild_id);
+                        idx_set_party(s2, ci.party_id);  // keeps g_by_party in sync
+                        idx_set_guild(s2, ci.guild_id);  // keeps g_by_guild in sync
+                    }
                 }
             }
-            s->db_refresh_tick = now_t;
         }
-        maybe_send_war_state_locked(s);
     }
 }
 
@@ -1292,12 +1307,18 @@ static void clear_existing_whisper(ClientSession* s) {
     g_whisper.end(old_sid, s->char_id);
     s->whisper_sid.clear();
 
+    // Notify s that their old session ended. Without this, the DLL keeps
+    // channel_=Whisper and then when the new whisper_active arrives it
+    // saves pre_whisper_channel_=Whisper, permanently trapping the player
+    // in Whisper once the new call ends.
+    if (s->ws) send_json(s->ws, json{{"type","whisper_ended"},{"sid",old_sid}});
+
     auto it = g_by_char_id.find(peer_id);
     if (it != g_by_char_id.end() && it->second) {
         ClientSession* peer = it->second;
         if (peer->whisper_sid == old_sid)
             peer->whisper_sid.clear();
-        send_json(peer->ws, json{{"type","whisper_ended"},{"sid",old_sid}});
+        if (peer->ws) send_json(peer->ws, json{{"type","whisper_ended"},{"sid",old_sid}});
     }
 }
 
