@@ -12,6 +12,7 @@ AC_CONFIG_FILES([3rdparty/libconfig/Makefile 3rdparty/yaml-cpp/Makefile 3rdparty
 AC_CONFIG_FILES([src/char/Makefile src/login/Makefile])
 AC_CONFIG_FILES([src/map/Makefile src/tool/Makefile])
 AC_CONFIG_FILES([src/web/Makefile])
+AC_CONFIG_FILES([src/voice/Makefile])
 
 AC_GNU_SOURCE
 
@@ -1358,6 +1359,29 @@ if test -n "`$CC --version | grep -i mingw`" ; then
 else
 	AC_MSG_RESULT([no])
 fi
+
+#
+# uWebSockets / uSockets submodules (required for voice server)
+#
+AC_MSG_CHECKING([for uWebSockets submodule])
+AS_IF([test -f "3rdparty/uWebSockets/src/App.h"],
+	[AC_MSG_RESULT([yes])],
+	[AC_MSG_RESULT([no])
+	 AC_MSG_ERROR([uWebSockets not found. Run: git submodule update --init 3rdparty/uWebSockets 3rdparty/uSockets])])
+
+AC_MSG_CHECKING([for uSockets submodule])
+AS_IF([test -f "3rdparty/uSockets/src/libusockets.h"],
+	[AC_MSG_RESULT([yes])],
+	[AC_MSG_RESULT([no])
+	 AC_MSG_ERROR([uSockets not found. Run: git submodule update --init 3rdparty/uWebSockets 3rdparty/uSockets])])
+
+
+#
+# libuv library (required for voice server)
+#
+AC_SEARCH_LIBS([uv_run], [uv], [], [AC_MSG_ERROR([libuv not found. Install with: apt install libuv1-dev  (or equivalent for your distro)])])
+AC_CHECK_HEADER([uv.h], [], [AC_MSG_ERROR([libuv header (uv.h) not found. Install with: apt install libuv1-dev  (or equivalent for your distro)])])
+
 
 CXXFLAG_CLEARS="-std=c++17 $CPPFLAGS"
 CFLAGS="$OPT_LTO $CFLAGS" 

@@ -1,0 +1,82 @@
+RA_INCLUDE = -I../../
+
+UWS_DIR    = ../../3rdparty/uWebSockets
+USOCKS_DIR = ../../3rdparty/uSockets
+JSON_DIR   = ../../3rdparty/json
+
+VOICE_OBJ = $(patsubst %.cpp,obj/%.o,$(wildcard *.cpp))
+VOICE_H   = $(wildcard *.hpp)
+
+USOCKS_OBJS = \
+	obj/usocks/bsd.o \
+	obj/usocks/context.o \
+	obj/usocks/loop.o \
+	obj/usocks/socket.o \
+	obj/usocks/udp.o \
+	obj/usocks/eventing/libuv.o
+
+LIBUV_CFLAGS = $(shell pkg-config --cflags libuv 2>/dev/null)
+LIBUV_LIBS   = $(shell pkg-config --libs libuv 2>/dev/null || echo "-luv")
+
+VOICE_INCLUDE = \
+	$(RA_INCLUDE) \
+	-I$(UWS_DIR)/src \
+	-I$(USOCKS_DIR)/src \
+	-I$(JSON_DIR)/include \
+	$(LIBUV_CFLAGS)
+
+VOICE_DEFS = -DLIBUS_NO_SSL -DLIBUS_USE_LIBUV -DWITH_SQL
+
+HAVE_MYSQL=@HAVE_MYSQL@
+ifeq ($(HAVE_MYSQL),yes)
+	SERVER_DEPENDS=voice-server
+else
+	SERVER_DEPENDS=needs_mysql
+endif
+ALL_DEPENDS=server
+
+@SET_MAKE@
+
+#####################################################################
+.PHONY: all server clean help needs_mysql
+
+all: $(ALL_DEPENDS)
+
+server: $(SERVER_DEPENDS)
+
+clean:
+	@echo "	CLEAN	voice"
+	@rm -rf obj ../../voice-server@EXEEXT@
+
+help:
+	@echo "possible targets are 'server' 'all' 'clean' 'help'"
+	@echo "'server'  - voice server"
+	@echo "'all'     - builds all above targets"
+	@echo "'clean'   - cleans builds and objects"
+	@echo "'help'    - outputs this message"
+
+#####################################################################
+
+needs_mysql:
+	@echo "MySQL not found or disabled by the configure script"
+	@exit 1
+
+obj obj/usocks obj/usocks/eventing:
+	@echo "	MKDIR	$@"
+	@mkdir -p $@
+
+voice-server: $(VOICE_OBJ) $(USOCKS_OBJS)
+	@echo "	LD	voice-server@EXEEXT@"
+	@@CXX@ @LDFLAGS@ -o ../../voice-server@EXEEXT@ $(VOICE_OBJ) $(USOCKS_OBJS) @LIBS@ @MYSQL_LIBS@ $(LIBUV_LIBS) -lpthread
+
+obj/%.o: %.cpp $(VOICE_H) | obj
+	@echo "	CXX	$<"
+	@@CXX@ @CXXFLAGS@ $(VOICE_INCLUDE) $(VOICE_DEFS) @MYSQL_CFLAGS@ @CPPFLAGS@ -c -o $@ $<
+
+obj/usocks/%.o: $(USOCKS_DIR)/src/%.c | obj/usocks
+	@echo "	CC	$<"
+	@@CC@ @CFLAGS@ $(VOICE_INCLUDE) $(VOICE_DEFS) -c -o $@ $<
+
+obj/usocks/eventing/%.o: $(USOCKS_DIR)/src/eventing/%.c | obj/usocks/eventing
+	@echo "	CC	$<"
+	@@CC@ @CFLAGS@ $(VOICE_INCLUDE) $(VOICE_DEFS) -c -o $@ $<

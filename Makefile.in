@@ -4,7 +4,7 @@ HAVE_MYSQL=@HAVE_MYSQL@
 OMAP=@OMAP@
 ifeq ($(HAVE_MYSQL),yes)
 	ALL_DEPENDS=server tools
-	SERVER_DEPENDS=common login char map web import
+	SERVER_DEPENDS=common login char map web voice import
 	COMMON_DEPENDS=libconfig rapidyaml yaml-cpp
 	LOGIN_DEPENDS=libconfig common
 	CHAR_DEPENDS=libconfig common rapidyaml
@@ -28,6 +28,7 @@ endif
 	char \
 	map \
 	web \
+	voice \
 	tools \
 	import \
 	clean help \
@@ -54,6 +55,9 @@ map: $(MAP_DEPENDS)
 
 web: $(WEB_DEPENDS)
 	@$(MAKE) -C src/web server
+
+voice:
+	@$(MAKE) -C src/voice server
 
 libconfig:
 	@$(MAKE) -C 3rdparty/libconfig
@@ -96,6 +100,7 @@ clean:
 	@$(MAKE) -C src/char $@
 	@$(MAKE) -C src/map $@
 	@$(MAKE) -C src/web $@
+	@$(MAKE) -C src/voice $@
 	@$(MAKE) -C src/tool $@
 
 help:
@@ -110,10 +115,11 @@ help:
 	@echo "'char'        - builds char server"
 	@echo "'map'         - builds map server"
 	@echo "'web'         - builds web server"
+	@echo "'voice'       - builds voice server"
 	@echo "'tools'       - builds all the tools in src/tools"
 	@echo "'import'      - builds conf/import, conf/msg_conf/import and db/import folders from their template folders (x-tmpl)"
 	@echo "'all'         - builds all the above targets"
-	@echo "'server'      - builds servers (targets 'common' 'login' 'char' 'map' and 'import')"
+	@echo "'server'      - builds servers (targets 'common' 'login' 'char' 'map' 'web' 'voice' and 'import')"
 	@echo "'clean'       - cleans builds and objects"
 	@echo "'install'     - run installer which sets up rathena in /opt/"
 	@echo "'bin-clean'   - deletes installed binaries"
