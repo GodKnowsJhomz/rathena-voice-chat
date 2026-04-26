@@ -274,7 +274,7 @@ static CharInfo db_get_char_info(int char_id) {
     if (mysql_query(g_db, query.c_str()) != 0) {
         LOG_ERROR("DB query error: %s", mysql_error(g_db));
         if (!db_connect()) return {};
-        if (mysql_query(g_db, query) != 0) return {};
+		if (mysql_query(g_db, query.c_str()) != 0) return {};
     }
 
     MYSQL_RES* res = mysql_store_result(g_db);
