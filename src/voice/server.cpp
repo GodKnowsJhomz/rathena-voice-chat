@@ -267,12 +267,11 @@ static CharInfo db_get_char_info(int char_id) {
         if (!db_connect()) return {};
     }
 
-    char query[256];
-    snprintf(query, sizeof(query),
-             "SELECT `name`,`party_id`,`guild_id` FROM `%s` WHERE `char_id`=%d LIMIT 1",
-             g_cfg.db_char_table.c_str(), char_id);
+    std::string query = "SELECT `name`,`party_id`,`guild_id` FROM `"
+                      + g_cfg.db_char_table
+                      + "` WHERE `char_id`=" + std::to_string(char_id) + " LIMIT 1";
 
-    if (mysql_query(g_db, query) != 0) {
+    if (mysql_query(g_db, query.c_str()) != 0) {
         LOG_ERROR("DB query error: %s", mysql_error(g_db));
         if (!db_connect()) return {};
         if (mysql_query(g_db, query) != 0) return {};
@@ -304,11 +303,10 @@ static int db_lookup_char_by_name(const std::string& name) {
     char escaped[128] = {};
     mysql_real_escape_string(g_db, escaped, name.c_str(),
                              (unsigned long)std::min(name.size(), sizeof(escaped) / 2 - 1));
-    char query[256];
-    snprintf(query, sizeof(query),
-             "SELECT `char_id` FROM `%s` WHERE `name`='%s' LIMIT 1",
-             g_cfg.db_char_table.c_str(), escaped);
-    if (mysql_query(g_db, query) != 0) return 0;
+    std::string query = "SELECT `char_id` FROM `"
+                      + g_cfg.db_char_table
+                      + "` WHERE `name`='" + escaped + "' LIMIT 1";
+    if (mysql_query(g_db, query.c_str()) != 0) return 0;
     MYSQL_RES* res = mysql_store_result(g_db);
     if (!res) return 0;
     int char_id = 0;
@@ -2011,14 +2009,16 @@ void run_server() {
             auto* s = ws->getUserData();
 
             // Notify whisper peer on disconnect
-            if (!s->whisper_sid.empty()) {
-                int peer_id = g_whisper.get_peer(s->whisper_sid, s->char_id);
-                g_whisper.end(s->whisper_sid, s->char_id);
+            {
                 std::lock_guard<std::shared_mutex> lk2(g_session_mtx);
-                auto it = g_by_char_id.find(peer_id);
-                if (it != g_by_char_id.end() && it->second) {
-                    send_json_deferred(it->second, json{{"type","whisper_ended"},{"sid",s->whisper_sid}});
-                    it->second->whisper_sid.clear();
+                if (!s->whisper_sid.empty()) {
+                    int peer_id = g_whisper.get_peer(s->whisper_sid, s->char_id);
+                    g_whisper.end(s->whisper_sid, s->char_id);
+                    auto it = g_by_char_id.find(peer_id);
+                    if (it != g_by_char_id.end() && it->second) {
+                        send_json_deferred(it->second, json{{"type","whisper_ended"},{"sid",s->whisper_sid}});
+                        it->second->whisper_sid.clear();
+                    }
                 }
             }
 
