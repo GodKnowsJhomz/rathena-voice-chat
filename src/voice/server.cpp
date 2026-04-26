@@ -1781,9 +1781,12 @@ void run_server() {
                 if (type == "whisper_accept") {
                     std::string sid = j.value("sid", "");
                     if (!g_whisper.accept(sid, s->char_id)) return;
-                    s->whisper_sid = sid;
+                    // get_peer uses its own mutex — no g_session_mtx needed yet.
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    // Write whisper_sid inside the exclusive lock so the UDP audio-
+                    // routing path (shared_lock) never sees a torn std::string.
+                    s->whisper_sid = sid;
                     auto it = g_by_char_id.find(peer_id);
                     if (it != g_by_char_id.end() && it->second) {
                         send_json(it->second->ws, json{
@@ -1799,8 +1802,9 @@ void run_server() {
                     std::string sid = j.value("sid", "");
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
                     if (!g_whisper.reject(sid, s->char_id)) return;
-                    s->whisper_sid.clear();
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    // Clear inside the lock — UDP routing reads whisper_sid under shared_lock.
+                    s->whisper_sid.clear();
                     auto it = g_by_char_id.find(peer_id);
                     if (it != g_by_char_id.end() && it->second) {
                         send_json(it->second->ws, json{{"type","whisper_rejected"},{"sid",sid}});
@@ -1814,8 +1818,9 @@ void run_server() {
                     std::string sid = j.value("sid", "");
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
                     if (!g_whisper.end(sid, s->char_id)) return;
-                    s->whisper_sid.clear();
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    // Clear inside the lock — UDP routing reads whisper_sid under shared_lock.
+                    s->whisper_sid.clear();
                     auto it = g_by_char_id.find(peer_id);
                     if (it != g_by_char_id.end() && it->second) {
                         send_json(it->second->ws, json{{"type","whisper_ended"},{"sid",sid}});
@@ -1980,19 +1985,23 @@ void run_server() {
                         }
                         default: break;
                     }
-                }
 
-                trim_audio_targets(channel, s->char_id, targets);
-                LOG_DEBUG("audio targets=%zu for char_id=%d", targets.size(), s->char_id);
+                    // trim + send under the shared_lock so that the raw ClientSession*
+                    // pointers in targets[] remain valid for the duration of send_audio_to.
+                    // If we released the lock first, the close handler could free a session
+                    // between the lock release and the ws->send() call (use-after-free).
+                    trim_audio_targets(channel, s->char_id, targets);
+                    LOG_DEBUG("audio targets=%zu for char_id=%d", targets.size(), s->char_id);
 
-                size_t sent = 0;
-                for (auto& [to, vol] : targets) {
-                    if (send_audio_to(to, s->char_id, s->char_name, vol, s->x, s->y, seq, pcm, pcm_bytes))
-                        sent++;
-                }
-                if (sent != targets.size()) {
-                    LOG_DEBUG("audio partial fanout char_id=%d targets=%zu sent=%zu dropped=%zu",
-                              s->char_id, targets.size(), sent, targets.size() - sent);
+                    size_t sent = 0;
+                    for (auto& [to, vol] : targets) {
+                        if (send_audio_to(to, s->char_id, s->char_name, vol, s->x, s->y, seq, pcm, pcm_bytes))
+                            sent++;
+                    }
+                    if (sent != targets.size()) {
+                        LOG_DEBUG("audio partial fanout char_id=%d targets=%zu sent=%zu dropped=%zu",
+                                  s->char_id, targets.size(), sent, targets.size() - sent);
+                    }
                 }
                 return;
             }
