@@ -47,13 +47,17 @@ Players within range on the same map hear each other automatically. Moving away 
 
 ## Requirements
 
-- Windows (voice-server is Win32/x64)
-- Visual Studio 2019 or later
-- MySQL / MariaDB
+| | Windows | Linux |
+|---|---|---|
+| **Build** | Visual Studio 2019+ | GCC / Clang, autotools |
+| **Database** | MySQL / MariaDB | MySQL / MariaDB |
+| **Voice deps** | bundled (libuv, uWebSockets) | `libuv1-dev` via apt |
 
 ---
 
 ## Installation
+
+### Windows
 
 1. Clone with submodules:
    ```bash
@@ -70,6 +74,35 @@ Players within range on the same map hear each other automatically. Moving away 
    char-server.exe
    map-server.exe
    voice-server.exe
+   ```
+
+5. Inject the client DLL into your Ragnarok Online client.
+
+6. Log in — Voice Settings window will appear in-game.
+
+### Linux
+
+1. Clone and install dependencies (once):
+   ```bash
+   git clone https://github.com/Sitecraft-Admin/rathena-voice-chat.git
+   cd rathena-voice-chat
+   apt install libuv1-dev libmysqlclient-dev
+   git submodule update --init 3rdparty/uWebSockets 3rdparty/uSockets
+   ```
+
+2. Build:
+   ```bash
+   ./configure && make server
+   ```
+
+3. Configure `conf/voice_athena.conf`.
+
+4. Start servers in order:
+   ```bash
+   ./login-server
+   ./char-server
+   ./map-server
+   ./voice-server
    ```
 
 5. Inject the client DLL into your Ragnarok Online client.
