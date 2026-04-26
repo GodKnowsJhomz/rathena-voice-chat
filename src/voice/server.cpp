@@ -1,7 +1,6 @@
 #include <App.h>
 #include "whisper_manager.hpp"
 #include <nlohmann/json.hpp>
-#include "../../src/config/packets.hpp"
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -275,7 +274,7 @@ static CharInfo db_get_char_info(int char_id) {
     if (mysql_query(g_db, query.c_str()) != 0) {
         LOG_ERROR("DB query error: %s", mysql_error(g_db));
         if (!db_connect()) return {};
-        if (mysql_query(g_db, query.c_str()) != 0) return {};
+        if (mysql_query(g_db, query) != 0) return {};
     }
 
     MYSQL_RES* res = mysql_store_result(g_db);
@@ -1442,7 +1441,6 @@ void run_server() {
                 return;
             }
             LOG_STATUS("connection from %s", s->ip.c_str());
-            send_json(ws, json{{"type", "server_config"}, {"packetver", PACKETVER}});
         },
 
         .message = [](auto* ws, std::string_view message, uWS::OpCode opCode) {
