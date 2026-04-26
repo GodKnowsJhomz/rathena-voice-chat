@@ -1513,6 +1513,11 @@ void run_server() {
 
                     s->authed = true;
                     std::vector<std::pair<ClientSession*, std::string>> sessions_to_close;
+                    // Capture initial position to send your_pos after lock is released.
+                    // Values may be from pending_pos (position arrived before auth) or
+                    // from a prior reconnect (position already on session).
+                    std::string init_map;
+                    int init_x = 0, init_y = 0;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
 
@@ -1528,6 +1533,10 @@ void run_server() {
                             LOG_DEBUG("auth applied pending pos char_id=%d %s(%d,%d)", s->char_id, pp.map.c_str(), pp.x, pp.y);
                             g_pending_pos.erase(pit);
                         }
+                        // Snapshot position for your_pos (read while holding the lock)
+                        init_map = s->map;
+                        init_x   = s->x;
+                        init_y   = s->y;
 
                         // ── One active char per account ───────────────────
                         // An RO account can only own one logged-in character at
@@ -1605,6 +1614,17 @@ void run_server() {
                                s->party_id, s->guild_id, g_player_count);
                     send_json(ws, json{{"type", "auth_ok"}});
                     send_json(ws, make_war_state_json(*s));
+                    // Push initial position so the DLL knows where the player is
+                    // immediately — without this it stays at (0,0) until the next
+                    // map_pos UDP update, making stereo panning wrong on first connect.
+                    if (!init_map.empty()) {
+                        send_json(ws, json{
+                            {"type", "your_pos"},
+                            {"x",    init_x},
+                            {"y",    init_y},
+                            {"map",  init_map}
+                        });
+                    }
                     return;
                 }
 
