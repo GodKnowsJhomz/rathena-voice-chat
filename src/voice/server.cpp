@@ -678,7 +678,7 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
 #endif
 
 // Global uWS loop pointer – set once from the uWS thread before UDP starts
-static uWS::Loop* g_uws_loop = nullptr;
+static std::atomic<uWS::Loop*> g_uws_loop{nullptr};
 
 // Helper: queue a JSON send onto the uWS event loop (thread-safe).
 // We capture stable session identity (char_id + session_id) instead of a raw
@@ -807,7 +807,7 @@ static void udp_position_loop() {
 
                 // Expire IP flood bans
                 for (auto it = g_flood_bans.begin(); it != g_flood_bans.end(); ) {
-                    if (now_maint >= it->second.until_tick) {
+                    if ((int32_t)(now_maint - it->second.until_tick) >= 0) {
                         LOG_INFO("flood_ban expired ip=%s", it->first.c_str());
                         it = g_flood_bans.erase(it);
                     } else {
@@ -1411,7 +1411,7 @@ void run_server() {
         .closeOnBackpressureLimit = false,
         .open = [](auto* ws) {
             // Capture the uWS loop once so UDP thread can defer sends
-            if (!g_uws_loop) g_uws_loop = uWS::Loop::get();
+            if (!g_uws_loop.load()) g_uws_loop.store(uWS::Loop::get());
             auto* s = ws->getUserData();
             s->ws = ws;
             std::string ip = normalize_ip(ws->getRemoteAddressAsText());
