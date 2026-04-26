@@ -86,8 +86,17 @@ Players within range on the same map hear each other automatically. Moving away 
    ```bash
    git clone https://github.com/Sitecraft-Admin/rathena-voice-chat.git
    cd rathena-voice-chat
-   apt install libuv1-dev libmysqlclient-dev
    git submodule update --init 3rdparty/uWebSockets 3rdparty/uSockets
+   ```
+
+   **Ubuntu / Debian:**
+   ```bash
+   apt install libuv1-dev libmysqlclient-dev zlib1g-dev
+   ```
+
+   **AlmaLinux / Rocky / RHEL / CentOS:**
+   ```bash
+   sudo dnf install libuv-devel mysql-devel zlib-devel
    ```
 
 2. Build:
