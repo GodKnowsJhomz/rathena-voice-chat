@@ -685,12 +685,12 @@ static std::atomic<uWS::Loop*> g_uws_loop{nullptr};
 // websocket pointer so a disconnect/reconnect cannot leave us sending through
 // a stale uWS object after the target session is gone.
 static void send_json_deferred(ClientSession* target, json msg) {
-    if (!g_uws_loop) return;
+    if (!g_uws_loop.load()) return;
     if (!target || target->char_id == 0) return;
     const int target_char_id = target->char_id;
     const uint64_t target_session_id = target->session_id;
     std::string payload = msg.dump();
-    g_uws_loop->defer([target_char_id, target_session_id, payload = std::move(payload)]() {
+    g_uws_loop.load()->defer([target_char_id, target_session_id, payload = std::move(payload)]() {
         std::shared_lock<std::shared_mutex> lock(g_session_mtx);
         auto it = g_by_char_id.find(target_char_id);
         if (it == g_by_char_id.end() || !it->second) return;
@@ -766,9 +766,9 @@ static void udp_position_loop() {
         int ret = select(static_cast<int>(g_udp_sock) + 1, &readfds, nullptr, nullptr, &tv);
 
         // Config reload requested by SIGUSR1 — defer to uWS thread so it's safe
-        if (g_reload_requested.load() && g_uws_loop) {
+        if (g_reload_requested.load() && g_uws_loop.load()) {
             g_reload_requested.store(false);
-            g_uws_loop->defer([]() {
+            g_uws_loop.load()->defer([]() {
                 g_config = Config::load(g_conf_path);
                 LOG_INFO("Config reloaded from %s", g_conf_path.c_str());
             });
@@ -828,9 +828,9 @@ static void udp_position_loop() {
                 }
             }
 
-            if (!advisory_timeout_kicks.empty() && g_uws_loop) {
+            if (!advisory_timeout_kicks.empty() && g_uws_loop.load()) {
                 std::vector<std::pair<int, uint64_t>> victims = std::move(advisory_timeout_kicks);
-                g_uws_loop->defer([victims]() {
+                g_uws_loop.load()->defer([victims]() {
                     for (const auto& [char_id, session_id] : victims) {
                         ClientSession* s = nullptr;
                         {
@@ -850,11 +850,11 @@ static void udp_position_loop() {
             }
 
             // 2. Whisper timeout — notify both peers then drop expired sessions
-            if (g_cfg.whisper_timeout > 0 && g_uws_loop) {
+            if (g_cfg.whisper_timeout > 0 && g_uws_loop.load()) {
                 auto expired = g_whisper.collect_expired(
                     static_cast<int>(g_cfg.whisper_timeout));
                 if (!expired.empty()) {
-                    g_uws_loop->defer([expired = std::move(expired)]() {
+                    g_uws_loop.load()->defer([expired = std::move(expired)]() {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         const std::string payload =
                             json{{"type","whisper_ended"},{"reason","timeout"}}.dump();
@@ -892,7 +892,7 @@ static void udp_position_loop() {
         std::string type = j.value("type", "");
 
         if (type == "reload_config") {
-            g_uws_loop->defer([]() {
+            g_uws_loop.load()->defer([]() {
                 g_config = Config::load(g_conf_path);
                 LOG_INFO("Config reloaded via @reloadvoiceconf");
             });
@@ -964,13 +964,13 @@ static void udp_position_loop() {
                 if (confirm_target) {
                     LOG_INFO("auth confirmed via late advisory  char_id=%d aid=%d", cid, aid);
                 }
-                if (spoof_char_id > 0 && g_uws_loop) {
+                if (spoof_char_id > 0 && g_uws_loop.load()) {
                     int cid_cap = cid;
                     int adv_cap = spoof_aid_advisory;
                     int clm_cap = spoof_aid_claimed;
                     int target_char_id = spoof_char_id;
                     uint64_t target_session_id = spoof_session_id;
-                    g_uws_loop->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
+                    g_uws_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
                         ClientSession* target = nullptr;
                         {
                             std::shared_lock<std::shared_mutex> lock(g_session_mtx);
@@ -1014,8 +1014,8 @@ static void udp_position_loop() {
                 g_auth_advisories.erase(cid);
             }
 
-            if (g_uws_loop) {
-                g_uws_loop->defer([cid]() {
+            if (g_uws_loop.load()) {
+                g_uws_loop.load()->defer([cid]() {
                     // Step 1: lookup + set `kicking` flag under the session lock.
                     // We deliberately keep `authed` untouched here — the close
                     // handler below reads it to decrement g_player_count, and if
