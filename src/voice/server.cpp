@@ -62,6 +62,8 @@ struct SrvConfig {
     std::string db_pass       = "";
     std::string db_name       = "ragnarok";
     std::string db_char_table = "char";
+
+    std::string client_secret = "";
 } g_cfg;
 
 // Hard cutoff guard for practical "14 cells exact" behavior.
@@ -149,6 +151,9 @@ static void load_voice_conf(const char* path) {
         }
         else if (key == "voice_war_allow_whisper") {
             if (!val.empty()) g_cfg.war_allow_whisper = (std::stoi(val) != 0); return true;
+        }
+        else if (key == "voice_client_secret") {
+            g_cfg.client_secret = val; return true;
         }
         return false;
     });
@@ -1394,6 +1399,7 @@ void run_server() {
              g_cfg.db_port, g_cfg.db_name.c_str(),
              g_cfg.db_char_table.c_str(), g_cfg.db_refresh_s);
     LOG_INFO("Log level   %d", g_cfg.log_level);
+    LOG_INFO("Client auth secret: %s", g_cfg.client_secret.empty() ? "disabled (open)" : "enabled");
     printf("\n");
 
     if (!db_connect()) {
@@ -1458,6 +1464,15 @@ void run_server() {
                 const std::string type = j.value("type", "");
 
                 if (type == "auth") {
+                    if (!g_cfg.client_secret.empty()) {
+                        if (j.value("secret", "") != g_cfg.client_secret) {
+                            LOG_WARNING("auth REJECTED — bad or missing secret  ip=%s", s->ip.c_str());
+                            send_json(ws, json{{"type","error"},{"message","unauthorized"}});
+                            ws->end(1008, "bad secret");
+                            return;
+                        }
+                    }
+
                     // ── Reject re-auth on an already-authed session ───────────
                     // The DLL sometimes forgets to close its WebSocket when the
                     // user logs out to char-select and picks a different char.
