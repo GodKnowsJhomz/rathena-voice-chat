@@ -1630,6 +1630,18 @@ void run_server() {
                             idx_remove(old);
                         }
                         g_by_char_id[s->char_id] = s;
+
+                        // Advisory may have arrived during the DB call above (which
+                        // runs without any lock).  If so, confirm the session now so
+                        // the maintenance loop doesn't kick it after ADVISORY_GRACE_MS.
+                        if (s->awaiting_advisory) {
+                            auto ait = g_auth_advisories.find(s->char_id);
+                            if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id) {
+                                s->awaiting_advisory = false;
+                                LOG_DEBUG("auth advisory arrived during DB query — confirmed char_id=%d", s->char_id);
+                            }
+                        }
+
                         idx_insert(s);   // add to channel indexes
 
                         // If we replaced an existing authed session, count stays the same.
