@@ -9,8 +9,7 @@
 
 // Forward declare from server.cpp
 void run_server();
-
-static std::atomic<bool> g_running{true};
+void request_server_stop();
 
 static void signal_handler(int sig) {
 #ifdef SIGUSR1
@@ -19,9 +18,7 @@ static void signal_handler(int sig) {
         return;
     }
 #endif
-    g_running = false;
-    std::cout << "\n[Voice] Shutting down...\n";
-    std::exit(0);
+    g_shutdown_requested.store(true);
 }
 
 
@@ -47,8 +44,19 @@ int main(int argc, char* argv[]) {
   Discord: https://discord.com/invite/aTkZw9ZrQ9
 )" << "\n";
 
+    std::thread shutdown_monitor([]() {
+        while (!g_shutdown_requested.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::cout << "\n[Voice] Shutting down...\n";
+        request_server_stop();
+    });
+
     // Run WebSocket server (blocks)
     run_server();
+
+    g_shutdown_requested.store(true);
+    if (shutdown_monitor.joinable())
+        shutdown_monitor.join();
 
     return 0;
 }

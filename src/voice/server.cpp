@@ -43,6 +43,9 @@ using json = nlohmann::json;
 struct SrvConfig {
     std::string voice_ip             = "0.0.0.0";
     int         voice_port           = 7000;
+    std::string voice_api_ip         = "127.0.0.1";
+    int         voice_api_port       = 7001;
+    std::string voice_bridge_secret;
     float       proximity_full_range = 1.0f;
     float       proximity_max_range  = 14.0f;
     int         proximity_update_ms  = 50;
@@ -116,6 +119,15 @@ static void load_voice_conf(const char* path) {
     int n = parse_kv_file(path, [](const std::string& key, const std::string& val) -> bool {
         if      (key == "voice_ip") { if (!val.empty()) g_cfg.voice_ip = val; return true; }
         else if (key == "voice_port") { if (!val.empty()) g_cfg.voice_port = std::stoi(val); return true; }
+        else if (key == "voice_api_ip" || key == "voice_api_bind_ip") {
+            if (!val.empty()) g_cfg.voice_api_ip = val; return true;
+        }
+        else if (key == "voice_api_port") {
+            if (!val.empty()) g_cfg.voice_api_port = std::stoi(val); return true;
+        }
+        else if (key == "voice_bridge_secret") {
+            g_cfg.voice_bridge_secret = val; return true;
+        }
         else if (key == "proximity_full_range" || key == "voice_proximity_full_range") {
             if (!val.empty()) g_cfg.proximity_full_range = std::stof(val); return true;
         }
@@ -668,6 +680,7 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
 // Format: {"type":"map_pos","char_id":123,"map":"prontera","x":150,"y":100,"party_id":1,"guild_id":2}
 #ifdef _WIN32
 #  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  pragma comment(lib, "ws2_32.lib")
    using sock_len_t = int;
 #else
@@ -763,6 +776,51 @@ static void maybe_send_war_state_locked(ClientSession* s) {
 static SOCKET g_udp_sock = INVALID_SOCKET;
 static std::thread g_udp_thread;
 static std::atomic<bool> g_udp_running{false};
+static std::atomic<bool> g_server_stop_requested{false};
+static uWS::App* g_app = nullptr;
+
+static void stop_udp_receiver();
+
+static std::string udp_addr_to_ip(const sockaddr_in& addr) {
+    char ip[INET_ADDRSTRLEN] = {};
+    const char* ok = inet_ntop(AF_INET, const_cast<in_addr*>(&addr.sin_addr), ip, sizeof(ip));
+    return ok ? std::string(ip) : std::string{};
+}
+
+static bool udp_source_allowed(const sockaddr_in& from_addr) {
+    const std::string ip = udp_addr_to_ip(from_addr);
+    return ip == g_cfg.voice_api_ip;
+}
+
+static bool udp_secret_allowed(const json& j) {
+    if (g_cfg.voice_bridge_secret.empty())
+        return true;
+    return j.value("bridge_secret", "") == g_cfg.voice_bridge_secret;
+}
+
+void request_server_stop() {
+    if (g_server_stop_requested.exchange(true))
+        return;
+
+    uWS::Loop* loop = g_uws_loop.load();
+    if (loop) {
+        loop->defer([]() {
+            LOG_INFO("Shutdown requested");
+            stop_udp_receiver();
+            {
+                std::lock_guard<std::mutex> lock(g_db_mtx);
+                if (g_db) {
+                    mysql_close(g_db);
+                    g_db = nullptr;
+                }
+            }
+            if (g_app)
+                g_app->close();
+        });
+    } else {
+        stop_udp_receiver();
+    }
+}
 
 static void udp_position_loop() {
     char buf[1024];
@@ -900,6 +958,11 @@ static void udp_position_loop() {
                                 reinterpret_cast<sockaddr*>(&from_addr), &from_len);
         if (recv_len <= 0) continue;
 
+        if (!udp_source_allowed(from_addr)) {
+            LOG_WARNING("UDP control rejected from unexpected source %s", udp_addr_to_ip(from_addr).c_str());
+            continue;
+        }
+
         buf[recv_len] = '\0';
 
         // Parse JSON
@@ -907,6 +970,11 @@ static void udp_position_loop() {
         try {
             j = json::parse(buf);
         } catch (...) {
+            continue;
+        }
+
+        if (!udp_secret_allowed(j)) {
+            LOG_WARNING("UDP control rejected from %s: bad bridge secret", udp_addr_to_ip(from_addr).c_str());
             continue;
         }
 
@@ -1215,14 +1283,22 @@ static bool init_udp_receiver() {
         return false;
     }
 
-    // Bind to port 7001 (same port used by voice_bridge)
+    // Bind to the private map-server bridge/API port.
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(7001);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(static_cast<uint16_t>(g_cfg.voice_api_port));
+    if (inet_pton(AF_INET, g_cfg.voice_api_ip.c_str(), &addr.sin_addr) != 1) {
+        LOG_ERROR("Invalid voice_api_ip: %s", g_cfg.voice_api_ip.c_str());
+        closesocket(g_udp_sock);
+        g_udp_sock = INVALID_SOCKET;
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return false;
+    }
 
     if (bind(g_udp_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        LOG_ERROR("UDP bind failed on port 7001");
+        LOG_ERROR("UDP bind failed on %s:%d", g_cfg.voice_api_ip.c_str(), g_cfg.voice_api_port);
         closesocket(g_udp_sock);
         g_udp_sock = INVALID_SOCKET;
 #ifdef _WIN32
@@ -1241,7 +1317,7 @@ static bool init_udp_receiver() {
     g_udp_running = true;
     g_udp_thread = std::thread(udp_position_loop);
 
-    LOG_NOTICE("UDP position receiver started on port 7001");
+    LOG_NOTICE("UDP control receiver started on %s:%d", g_cfg.voice_api_ip.c_str(), g_cfg.voice_api_port);
     return true;
 }
 
@@ -1397,7 +1473,7 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
 
 void run_server() {
     con::init();
-    load_voice_conf("conf/voice_athena.conf");
+    load_voice_conf(g_conf_path.c_str());
     load_inter_conf("conf/inter_athena.conf");
 
     printf("\n");
@@ -1407,6 +1483,9 @@ void run_server() {
     printf("\n");
 
     LOG_STATUS("Bind        %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
+    LOG_STATUS("Bridge API  %s:%d  secret=%s",
+               g_cfg.voice_api_ip.c_str(), g_cfg.voice_api_port,
+               g_cfg.voice_bridge_secret.empty() ? "disabled" : "enabled");
     LOG_INFO("Proximity   full=%.0f cell  max=%.0f cell  update=%dms  guard=%.2f",
              g_cfg.proximity_full_range, g_cfg.proximity_max_range,
              g_cfg.proximity_update_ms, PROXIMITY_EDGE_GUARD_CELLS);
@@ -1432,7 +1511,9 @@ void run_server() {
         LOG_WARNING("UDP receiver failed to start — positions from Map Server will not work");
     }
 
-    uWS::App().ws<ClientSession>("/*", {
+    uWS::App app;
+    g_app = &app;
+    app.ws<ClientSession>("/*", {
         .maxPayloadLength = 2048,
         .maxBackpressure = 64 * 1024,
         .closeOnBackpressureLimit = false,
@@ -2098,4 +2179,13 @@ void run_server() {
         if (token) LOG_STATUS("Listening on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
         else       LOG_ERROR("Failed to listen on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
     }).run();
+    stop_udp_receiver();
+    {
+        std::lock_guard<std::mutex> lock(g_db_mtx);
+        if (g_db) {
+            mysql_close(g_db);
+            g_db = nullptr;
+        }
+    }
+    g_app = nullptr;
 }

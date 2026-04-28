@@ -23,28 +23,115 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 	socket_t    g_sock       = INVALID_SOCK;
 	sockaddr_in g_voice_addr{};
 	bool        g_ready      = false;
+	std::string g_bridge_secret;
+
+	std::string trim_copy(std::string s) {
+		size_t a = s.find_first_not_of(" \t\r\n");
+		size_t b = s.find_last_not_of(" \t\r\n");
+		return (a == std::string::npos) ? std::string{} : s.substr(a, b - a + 1);
+	}
+
+	std::string base_dir_of(const std::string& path) {
+		size_t slash = path.find_last_of("/\\");
+		return (slash == std::string::npos) ? std::string{} : path.substr(0, slash + 1);
+	}
+
+	std::string join_path(const std::string& base_dir, const std::string& rel) {
+		if (rel.empty()) return base_dir;
+		if (rel.size() > 1 && rel[1] == ':') return rel;
+		if (rel[0] == '/' || rel[0] == '\\') return rel;
+		return base_dir + rel;
+	}
+
+	void load_bridge_conf_file(const std::string& path, std::string& host, int& port, std::unordered_set<std::string>& seen) {
+		if (!seen.insert(path).second)
+			return;
+
+		std::ifstream f(path);
+		if (!f.is_open())
+			return;
+
+		const std::string base_dir = base_dir_of(path);
+		std::string line;
+		while (std::getline(f, line)) {
+			size_t comment = line.find("//");
+			if (comment != std::string::npos)
+				line = line.substr(0, comment);
+			size_t sep = line.find(':');
+			if (sep == std::string::npos)
+				continue;
+
+			std::string key = trim_copy(line.substr(0, sep));
+			std::string val = trim_copy(line.substr(sep + 1));
+			if (key == "import") {
+				load_bridge_conf_file(join_path(base_dir, val), host, port, seen);
+			} else if (key == "voice_api_ip" || key == "voice_api_host") {
+				if (!val.empty())
+					host = val;
+			} else if (key == "voice_api_port") {
+				if (!val.empty())
+					port = std::atoi(val.c_str());
+			} else if (key == "voice_bridge_secret") {
+				g_bridge_secret = val;
+			}
+		}
+	}
+
+	void load_bridge_conf(std::string& host, int& port) {
+		std::unordered_set<std::string> seen;
+		load_bridge_conf_file("conf/voice_athena.conf", host, port, seen);
+	}
+
+	std::string json_escape(const std::string& s) {
+		std::string out;
+		out.reserve(s.size() + 8);
+		for (char ch : s) {
+			switch (ch) {
+				case '\\': out += "\\\\"; break;
+				case '"':  out += "\\\""; break;
+				case '\n': out += "\\n";  break;
+				case '\r': out += "\\r";  break;
+				case '\t': out += "\\t";  break;
+				default:   out.push_back(ch); break;
+			}
+		}
+		return out;
+	}
+
+	std::string attach_bridge_secret(const std::string& s) {
+		if (g_bridge_secret.empty() || s.empty() || s.back() != '}')
+			return s;
+		std::string out = s;
+		out.insert(out.size() - 1, ",\"bridge_secret\":\"" + json_escape(g_bridge_secret) + "\"");
+		return out;
+	}
 
 	bool voice_bridge_send_text(const std::string& s) {
 		if (!g_ready || g_sock == INVALID_SOCK)
 			return false;
 
+		const std::string payload = attach_bridge_secret(s);
 		int rc = sendto(
 			g_sock,
-			s.c_str(),
-			static_cast<int>(s.size()),
+			payload.c_str(),
+			static_cast<int>(payload.size()),
 			0,
 			reinterpret_cast<const sockaddr*>(&g_voice_addr),
 			sizeof(g_voice_addr)
 		);
-		return rc == static_cast<int>(s.size());
+		return rc == static_cast<int>(payload.size());
 	}
 
 	// Last-sent position cache — keyed by char_id.
@@ -129,10 +216,19 @@ void voice_bridge_init() {
 		return;
 	}
 
+	std::string voice_host = "127.0.0.1";
+	int voice_port = 7001;
+	load_bridge_conf(voice_host, voice_port);
+
 	std::memset(&g_voice_addr, 0, sizeof(g_voice_addr));
 	g_voice_addr.sin_family = AF_INET;
-	g_voice_addr.sin_port = htons(7001);
-	inet_pton(AF_INET, "127.0.0.1", &g_voice_addr.sin_addr);
+	g_voice_addr.sin_port = htons(static_cast<uint16_t>(voice_port));
+	if (inet_pton(AF_INET, voice_host.c_str(), &g_voice_addr.sin_addr) != 1) {
+		close_socket(g_sock);
+		g_sock = INVALID_SOCK;
+		wsa_cleanup();
+		return;
+	}
 
 	g_ready = true;
 	voice_bridge_send_guild_war_state(is_agit_start());

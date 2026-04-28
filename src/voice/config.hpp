@@ -53,6 +53,7 @@ struct Config {
 extern Config g_config;
 extern std::string         g_conf_path;
 extern std::atomic<bool>   g_reload_requested;
+extern std::atomic<bool>   g_shutdown_requested;
 
 #define LOG_ERROR 1
 #define LOG_INFO  2

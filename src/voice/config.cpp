@@ -9,6 +9,7 @@
 Config             g_config;
 std::string        g_conf_path;
 std::atomic<bool>  g_reload_requested{false};
+std::atomic<bool>  g_shutdown_requested{false};
 
 static std::string trim(const std::string& s) {
     auto a = s.find_first_not_of(" \t\r\n");
