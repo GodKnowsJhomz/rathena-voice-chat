@@ -26,6 +26,7 @@ static std::string join_path(const std::string& base_dir, const std::string& rel
     if (rel.empty()) return base_dir;
     if (rel.size() > 1 && rel[1] == ':') return rel;
     if (rel[0] == '/' || rel[0] == '\\') return rel;
+    if (rel.rfind("conf/", 0) == 0 || rel.rfind("conf\\", 0) == 0) return rel;
     return base_dir + rel;
 }
 
