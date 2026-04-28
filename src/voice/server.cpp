@@ -365,6 +365,7 @@ struct ClientSession {
     bool        client_war_map        = false;
     int         client_war_recommend  = -2;
     std::string whisper_sid;    // active or pending whisper session ID
+    uint32_t    last_nearby_ms        = 0;  // last time nearby_players was broadcast to this client
 
     // Token bucket rate limiter for audio packets
     // Normal speech = 50 packets/sec (20ms frames). Allow burst up to 100.
@@ -703,6 +704,21 @@ static void send_json_deferred(ClientSession* target, json msg) {
         if (current->session_id != target_session_id || !current->ws) return;
         current->ws->send(payload, uWS::OpCode::TEXT);
     });
+}
+
+static constexpr uint32_t NEARBY_BROADCAST_INTERVAL_MS = 1000;
+static void send_nearby_players_deferred(ClientSession* s) {
+    if (!s || !s->authed || s->map.empty()) return;
+    json players = json::array();
+    auto map_it = g_by_map.find(s->map);
+    if (map_it != g_by_map.end()) {
+        for (ClientSession* other : map_it->second) {
+            if (!other || other->char_id == s->char_id || !other->authed) continue;
+            if (calc_volume(*s, *other) > 0.0f)
+                players.push_back({{"id", other->char_id}, {"name", other->char_name}});
+        }
+    }
+    send_json_deferred(s, json{{"type", "nearby_players"}, {"players", players}});
 }
 
 static bool is_war_restricted_session(const ClientSession& s) {
@@ -1142,6 +1158,11 @@ static void udp_position_loop() {
                 {"y",    new_y},
                 {"map",  new_map}
             });
+        }
+
+        if (s->authed && tick_ms() - s->last_nearby_ms >= NEARBY_BROADCAST_INTERVAL_MS) {
+            s->last_nearby_ms = tick_ms();
+            send_nearby_players_deferred(s);
         }
 
         // DB refresh — snapshot char_id and bump tick NOW (under lock) so rapid
@@ -1670,6 +1691,8 @@ void run_server() {
                             {"y",    init_y},
                             {"map",  init_map}
                         });
+                        std::shared_lock<std::shared_mutex> nl(g_session_mtx);
+                        send_nearby_players_deferred(s);
                     }
                     return;
                 }
