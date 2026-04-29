@@ -20,7 +20,7 @@
 - **Direct Call** — Call any character by name privately via the Voice Call window.
 - **Mic & Speaker volume sliders** — Adjustable directly in-game.
 - **War Mode** — Separate voice behavior during Guild vs Guild / WoE events.
-- **Low latency** — Built on WebSocket + Opus audio codec.
+- **Low latency** — Built on raw TCP + Opus audio codec.
 
 ---
 
@@ -28,7 +28,7 @@
 
 | Component | Description |
 |-----------|-------------|
-| **voice-server** | Standalone WebSocket server (`src/voice/`) that routes audio between players |
+| **voice-server** | Standalone raw TCP server (`src/voice/`) that routes audio between players |
 | **map-server hook** | `voice_bridge.cpp` sends player position & auth to voice-server via UDP |
 | **Client DLL** | Injected into RO client — captures mic, encodes with Opus, plays back received audio |
 
@@ -52,7 +52,7 @@ Players within range on the same map hear each other automatically. Moving away 
 |---|---|---|
 | **Build** | Visual Studio 2019+ | GCC / Clang, autotools |
 | **Database** | MySQL / MariaDB | MySQL / MariaDB |
-| **Voice deps** | bundled (libuv, uWebSockets) | `libuv1-dev` via apt |
+| **Voice deps** | bundled JSON + MySQL client | MySQL client development package |
 
 ---
 
@@ -87,17 +87,17 @@ Players within range on the same map hear each other automatically. Moving away 
    ```bash
    git clone https://github.com/Sitecraft-Admin/rathena-voice-chat.git
    cd rathena-voice-chat
-   git submodule update --init 3rdparty/uWebSockets 3rdparty/uSockets
+   # No voice transport submodules are required.
    ```
 
    **Ubuntu / Debian:**
    ```bash
-   apt install libuv1-dev libmysqlclient-dev zlib1g-dev
+   apt install libmysqlclient-dev zlib1g-dev
    ```
 
    **AlmaLinux / Rocky / RHEL / CentOS:**
    ```bash
-   sudo dnf config-manager --enable crb && sudo dnf install libuv-devel
+   sudo dnf config-manager --enable crb && sudo dnf install mysql-devel zlib-devel
    ```
 
 2. Build:

@@ -1,4 +1,4 @@
-#include <App.h>
+#include "raw_tcp_server.hpp"
 #include "whisper_manager.hpp"
 #include <nlohmann/json.hpp>
 #include <unordered_map>
@@ -696,13 +696,13 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
    using sock_len_t = socklen_t;
 #endif
 
-// Global uWS loop pointer – set once from the uWS thread before UDP starts
+// Global server loop pointer, set once from the raw TCP server thread before UDP starts.
 static std::atomic<uWS::Loop*> g_uws_loop{nullptr};
 
-// Helper: queue a JSON send onto the uWS event loop (thread-safe).
+// Helper: queue a JSON send onto the server loop (thread-safe).
 // We capture stable session identity (char_id + session_id) instead of a raw
-// websocket pointer so a disconnect/reconnect cannot leave us sending through
-// a stale uWS object after the target session is gone.
+// connection pointer so a disconnect/reconnect cannot leave us sending through
+// a stale connection object after the target session is gone.
 static void send_json_deferred(ClientSession* target, json msg) {
     if (!g_uws_loop.load()) return;
     if (!target || target->char_id == 0) return;
@@ -755,8 +755,8 @@ static json make_war_state_json(const ClientSession& s) {
     };
 }
 
-// Call while holding g_session_mtx. The actual websocket send is deferred to
-// the uWS loop and only happens when the visible client state changed.
+// Call while holding g_session_mtx. The actual socket send is deferred to
+// the server loop and only happens when the visible client state changed.
 static void maybe_send_war_state_locked(ClientSession* s) {
     if (!s || !s->authed) return;
 
@@ -852,7 +852,7 @@ static void udp_position_loop() {
 
         int ret = select(static_cast<int>(g_udp_sock) + 1, &readfds, nullptr, nullptr, &tv);
 
-        // Config reload requested by SIGUSR1 — defer to uWS thread so it's safe
+        // Config reload requested by SIGUSR1 — defer to server thread so it's safe
         if (g_reload_requested.load() && g_uws_loop.load()) {
             g_reload_requested.store(false);
             g_uws_loop.load()->defer([]() {
@@ -868,7 +868,7 @@ static void udp_position_loop() {
             last_maintenance = now_maint;
 
             // Sessions whose advisory grace window expired — collected under
-            // the lock, kicked after releasing it (ws->end must run on uWS loop).
+                // the lock, kicked after releasing it (ws->end must run on the server loop).
             std::vector<std::pair<int, uint64_t>> advisory_timeout_kicks;
 
             // 1. Pending position TTL — drop positions for players who never authed
@@ -905,7 +905,7 @@ static void udp_position_loop() {
 
                 // Kick provisional sessions whose advisory never arrived within
                 // the grace window. Collect here; actual ws->end() has to run
-                // on the uWS loop, so defer after releasing the lock.
+                // on the server loop, so defer after releasing the lock.
                 for (auto& kv : g_by_char_id) {
                     ClientSession* s = kv.second;
                     if (!s || !s->awaiting_advisory) continue;
@@ -1035,7 +1035,7 @@ static void udp_position_loop() {
             if (cid > 0 && aid > 0) {
                 // Holds the lock only briefly to update the advisory map + check
                 // for matching provisional sessions. Any WS kick is deferred
-                // onto the uWS loop because ws->end() must run there.
+                // onto the server loop because ws->end() must run there.
                 int spoof_char_id = 0;
                 uint64_t spoof_session_id = 0;
                 ClientSession* confirm_target = nullptr;
@@ -1147,9 +1147,9 @@ static void udp_position_loop() {
                         target->kicking = true;   // second auth_revoke will see this and bail
                     }
                     // Step 2: close the WS OUTSIDE the lock. ws->end() triggers
-                    // our close handler synchronously on this same uWS loop
+                    // our close handler synchronously on this same server loop
                     // thread, and that handler re-acquires g_session_mtx — holding
-                    // it here would deadlock. Since we're on the uWS thread and
+                    // it here would deadlock. Since we're on the server thread and
                     // the close handler only runs when we unwind, `target` stays
                     // valid across these two calls.
                     LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing WS", cid);
@@ -1508,7 +1508,7 @@ void run_server() {
     printf("%s ==========================================%s\n", con::CYAN,  con::RESET);
     printf("\n");
 
-    LOG_STATUS("Bind        %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
+    LOG_STATUS("Raw TCP     %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
     LOG_STATUS("Bridge API  %s:%d  secret=%s",
                g_cfg.voice_api_ip.c_str(), g_cfg.voice_api_port,
                g_cfg.voice_bridge_secret.empty() ? "disabled" : "enabled");
@@ -1532,7 +1532,7 @@ void run_server() {
         LOG_WARNING("DB not available — party/guild channels will not work until connected");
     }
 
-    // Capture the uWS loop before any clients connect so Ctrl+C/SIGTERM can
+    // Capture the server loop before any clients connect so Ctrl+C/SIGTERM can
     // always defer shutdown work onto the event-loop thread.
     g_uws_loop.store(uWS::Loop::get());
     if (g_server_stop_requested.load())
@@ -1606,9 +1606,9 @@ void run_server() {
                     }
 
                     // ── Reject re-auth on an already-authed session ───────────
-                    // The DLL sometimes forgets to close its WebSocket when the
+                    // The DLL sometimes forgets to close its connection when the
                     // user logs out to char-select and picks a different char.
-                    // It then sends a second `auth` frame on the same WS with
+                    // It then sends a second `auth` frame on the same connection with
                     // the new char_id. If we let that through we'd overwrite
                     // `s->char_id` in place and leave orphan entries in
                     // g_by_char_id pointing to the same session (online count

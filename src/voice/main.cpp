@@ -14,7 +14,7 @@ void request_server_stop();
 static void signal_handler(int sig) {
 #ifdef SIGUSR1
     if (sig == SIGUSR1) {
-        g_reload_requested.store(true);   // handled safely in uWS thread
+        g_reload_requested.store(true);   // handled safely in server thread
         return;
     }
 #endif
@@ -51,7 +51,7 @@ int main(int argc, char* argv[]) {
         request_server_stop();
     });
 
-    // Run WebSocket server (blocks)
+    // Run raw TCP server (blocks)
     run_server();
 
     g_shutdown_requested.store(true);

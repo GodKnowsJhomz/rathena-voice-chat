@@ -24,8 +24,7 @@ struct Player;
 using ListenerEntry = std::pair<Player*, float>; // player, volume
 
 struct Player {
-    // WebSocket handle (uWS::WebSocket<false, true, UserData>*)
-    // stored as void* to avoid template dependency
+    // Voice connection handle stored as void* to avoid transport dependency.
     void* ws = nullptr;
 
     // Identity
