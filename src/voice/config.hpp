@@ -48,6 +48,7 @@ struct Config {
     }
 
     static Config load(const std::string& path);
+    static Config load_voice_db(const std::string& conf_path);
 };
 
 extern Config g_config;

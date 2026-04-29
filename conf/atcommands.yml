@@ -1144,6 +1144,12 @@ Body:
   - Command: reloadatcommand
     Help: |
       Reload atcommand settings.
+  - Command: reloadvoiceconf
+    Help: |
+      Reload voice server configuration.
+  - Command: reloadvoicedb
+    Help: |
+      Reload voice server database files.
   - Command: reloadattendancedb
     Help: |
       Reload attendance database.

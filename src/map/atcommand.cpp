@@ -54,6 +54,7 @@
 #include "storage.hpp"
 #include "trade.hpp"
 #include "vending.hpp"
+#include "voice_bridge.hpp"
 
 using namespace rathena;
 
@@ -4422,6 +4423,24 @@ ACMD_FUNC(reloadatcommand){
 	atcommand_doload();
 	pc_groups_reload();
 	clif_displaymessage(fd, msg_txt(sd,254)); // GM command configuration has been reloaded.
+
+	return 0;
+}
+
+ACMD_FUNC(reloadvoiceconf){
+	nullpo_retr(-1, sd);
+
+	voice_bridge_send_reload_config();
+	clif_displaymessage(fd, "Voice server configuration reload requested.");
+
+	return 0;
+}
+
+ACMD_FUNC(reloadvoicedb){
+	nullpo_retr(-1, sd);
+
+	voice_bridge_send_reload_db();
+	clif_displaymessage(fd, "Voice server database reload requested.");
 
 	return 0;
 }
@@ -11590,6 +11609,8 @@ void atcommand_basecommands(void) {
 		ACMD_DEF(reloadskilldb),
 		ACMD_DEFR(reloadscript, ATCMD_NOSCRIPT),
 		ACMD_DEF(reloadatcommand),
+		ACMD_DEF(reloadvoiceconf),
+		ACMD_DEF(reloadvoicedb),
 		ACMD_DEF(reloadbattleconf),
 		ACMD_DEF(reloadstatusdb),
 		ACMD_DEF(reloadpcdb),

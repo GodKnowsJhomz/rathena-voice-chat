@@ -47,61 +47,9 @@ static std::vector<int> parse_int_list(const std::string& s) {
     return out;
 }
 
-Config Config::load(const std::string& path) {
-    Config cfg;
-
-    std::unordered_set<std::string> visited_paths;
-    std::vector<std::string> loaded_files;
-
-    auto load_conf_file = [&](auto&& self, const std::string& file_path) -> void {
-        if (!visited_paths.insert(file_path).second)
-            return;
-
-        std::ifstream f(file_path);
-        if (!f.is_open()) {
-            std::cerr << "[Config] Cannot open " << file_path << " - skipping\n";
-            return;
-        }
-
-        loaded_files.push_back(file_path);
-        const std::string base_dir = base_dir_of(file_path);
-
-        std::string line;
-        while (std::getline(f, line)) {
-            auto cmt = line.find("//");
-            if (cmt != std::string::npos) line = line.substr(0, cmt);
-            auto sep = line.find(':');
-            if (sep == std::string::npos) continue;
-            std::string key = trim(line.substr(0, sep));
-            std::string val = trim(line.substr(sep + 1));
-            if (key.empty() || val.empty()) continue;
-
-            if (key == "import") {
-                self(self, join_path(base_dir, val));
-                continue;
-            }
-
-            try {
-                if      (key == "bind_ip" || key == "voice_ip")    cfg.ip              = val;
-                else if (key == "voice_port")                       cfg.port            = std::stoi(val);
-                else if (key == "voice_api_port")                   cfg.api_port        = std::stoi(val);
-                else if (key == "proximity_full_range")             cfg.full_range      = std::stof(val);
-                else if (key == "proximity_max_range")              cfg.max_range       = std::stof(val);
-                else if (key == "proximity_update_ms")              cfg.prox_update_ms  = std::stoi(val);
-                else if (key == "whisper_timeout")                  cfg.whisper_timeout = std::stoi(val);
-                else if (key == "log_level")                        cfg.log_level       = std::stoi(val);
-            } catch (...) {
-            }
-        }
-    };
-
-    load_conf_file(load_conf_file, path);
-    if (loaded_files.empty()) {
-        std::cerr << "[Config] No config files loaded - using defaults\n";
-    } else {
-        for (const auto& file : loaded_files)
-            std::cout << "[Config] Loaded from " << file << "\n";
-    }
+static void load_voice_db_from_conf(Config& cfg, const std::string& path) {
+    cfg.blocked_maps.clear();
+    cfg.whisper_bypass_groups.clear();
 
     std::string dir = path;
     auto slash = dir.find_last_of("/\\");
@@ -111,7 +59,7 @@ Config Config::load(const std::string& path) {
     std::ifstream yf(yml_path);
     if (!yf.is_open()) {
         std::cerr << "[Config] Cannot open " << yml_path << "\n";
-        return cfg;
+        return;
     }
 
     enum class Section { None, Header, BlockedMaps, WhisperBypass };
@@ -205,10 +153,75 @@ Config Config::load(const std::string& path) {
         cfg.whisper_bypass_groups.clear();
         std::cerr << "[Config] Invalid " << yml_path
                   << " Header (expected Type=VOICE_BLOCKED_MAPS Version=1)\n";
-        return cfg;
+        return;
     }
 
     std::cout << "[Config] Blocked maps loaded: " << cfg.blocked_maps.size()
               << " rules, bypass groups: " << cfg.whisper_bypass_groups.size() << "\n";
+}
+
+Config Config::load(const std::string& path) {
+    Config cfg;
+
+    std::unordered_set<std::string> visited_paths;
+    std::vector<std::string> loaded_files;
+
+    auto load_conf_file = [&](auto&& self, const std::string& file_path) -> void {
+        if (!visited_paths.insert(file_path).second)
+            return;
+
+        std::ifstream f(file_path);
+        if (!f.is_open()) {
+            std::cerr << "[Config] Cannot open " << file_path << " - skipping\n";
+            return;
+        }
+
+        loaded_files.push_back(file_path);
+        const std::string base_dir = base_dir_of(file_path);
+
+        std::string line;
+        while (std::getline(f, line)) {
+            auto cmt = line.find("//");
+            if (cmt != std::string::npos) line = line.substr(0, cmt);
+            auto sep = line.find(':');
+            if (sep == std::string::npos) continue;
+            std::string key = trim(line.substr(0, sep));
+            std::string val = trim(line.substr(sep + 1));
+            if (key.empty() || val.empty()) continue;
+
+            if (key == "import") {
+                self(self, join_path(base_dir, val));
+                continue;
+            }
+
+            try {
+                if      (key == "bind_ip" || key == "voice_ip")    cfg.ip              = val;
+                else if (key == "voice_port")                       cfg.port            = std::stoi(val);
+                else if (key == "voice_api_port")                   cfg.api_port        = std::stoi(val);
+                else if (key == "proximity_full_range")             cfg.full_range      = std::stof(val);
+                else if (key == "proximity_max_range")              cfg.max_range       = std::stof(val);
+                else if (key == "proximity_update_ms")              cfg.prox_update_ms  = std::stoi(val);
+                else if (key == "whisper_timeout")                  cfg.whisper_timeout = std::stoi(val);
+                else if (key == "log_level")                        cfg.log_level       = std::stoi(val);
+            } catch (...) {
+            }
+        }
+    };
+
+    load_conf_file(load_conf_file, path);
+    if (loaded_files.empty()) {
+        std::cerr << "[Config] No config files loaded - using defaults\n";
+    } else {
+        for (const auto& file : loaded_files)
+            std::cout << "[Config] Loaded from " << file << "\n";
+    }
+
+    load_voice_db_from_conf(cfg, path);
+    return cfg;
+}
+
+Config Config::load_voice_db(const std::string& conf_path) {
+    Config cfg;
+    load_voice_db_from_conf(cfg, conf_path);
     return cfg;
 }

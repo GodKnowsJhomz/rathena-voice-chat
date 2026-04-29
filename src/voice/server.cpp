@@ -799,6 +799,12 @@ static bool udp_secret_allowed(const json& j) {
     return j.value("bridge_secret", "") == g_cfg.voice_bridge_secret;
 }
 
+static void reload_voice_db_config() {
+    Config db_cfg = Config::load_voice_db(g_conf_path);
+    g_config.blocked_maps = std::move(db_cfg.blocked_maps);
+    g_config.whisper_bypass_groups = std::move(db_cfg.whisper_bypass_groups);
+}
+
 void request_server_stop() {
     g_server_stop_requested.store(true);
 
@@ -850,8 +856,9 @@ static void udp_position_loop() {
         if (g_reload_requested.load() && g_uws_loop.load()) {
             g_reload_requested.store(false);
             g_uws_loop.load()->defer([]() {
-                g_config = Config::load(g_conf_path);
-                LOG_INFO("Config reloaded from %s", g_conf_path.c_str());
+                load_voice_conf(g_conf_path.c_str());
+                reload_voice_db_config();
+                LOG_INFO("Voice config and DB reloaded from %s", g_conf_path.c_str());
             });
         }
 
@@ -984,8 +991,25 @@ static void udp_position_loop() {
 
         if (type == "reload_config") {
             g_uws_loop.load()->defer([]() {
-                g_config = Config::load(g_conf_path);
-                LOG_INFO("Config reloaded via @reloadvoiceconf");
+                load_voice_conf(g_conf_path.c_str());
+                reload_voice_db_config();
+                LOG_INFO("Voice config and DB reloaded");
+            });
+            continue;
+        }
+
+        if (type == "reload_voice_conf") {
+            g_uws_loop.load()->defer([]() {
+                load_voice_conf(g_conf_path.c_str());
+                LOG_INFO("Voice config reloaded");
+            });
+            continue;
+        }
+
+        if (type == "reload_voice_db") {
+            g_uws_loop.load()->defer([]() {
+                reload_voice_db_config();
+                LOG_INFO("Voice DB reloaded");
             });
             continue;
         }

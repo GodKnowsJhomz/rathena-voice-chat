@@ -11,4 +11,5 @@ void voice_bridge_send_leave(map_session_data* sd);
 void voice_bridge_send_room_join(map_session_data* sd, int room_id);
 void voice_bridge_send_room_leave(map_session_data* sd);
 void voice_bridge_send_reload_config();
+void voice_bridge_send_reload_db();
 void voice_bridge_send_guild_war_state(bool active);

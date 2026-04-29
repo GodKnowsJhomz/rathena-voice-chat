@@ -333,7 +333,11 @@ void voice_bridge_send_room_leave(map_session_data* sd) {
 }
 
 void voice_bridge_send_reload_config() {
-	voice_bridge_send_text("{\"type\":\"reload_config\"}");
+	voice_bridge_send_text("{\"type\":\"reload_voice_conf\"}");
+}
+
+void voice_bridge_send_reload_db() {
+	voice_bridge_send_text("{\"type\":\"reload_voice_db\"}");
 }
 
 void voice_bridge_send_guild_war_state(bool active) {
