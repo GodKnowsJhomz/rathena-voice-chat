@@ -1152,7 +1152,7 @@ static void udp_position_loop() {
                     // it here would deadlock. Since we're on the server thread and
                     // the close handler only runs when we unwind, `target` stays
                     // valid across these two calls.
-                    LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing WS", cid);
+                    LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing connection", cid);
                     target->ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
                                      uWS::OpCode::TEXT);
                     target->ws->end(1000, "map logoff");
