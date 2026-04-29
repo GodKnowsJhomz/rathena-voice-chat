@@ -31,6 +31,7 @@
 #include "pc.hpp"
 #include "storage.hpp"
 #include "trade.hpp"
+#include "voice_bridge.hpp"
 
 using namespace rathena;
 
@@ -2535,6 +2536,7 @@ bool guild_agit_start(void){
 	}
 
 	agit_flag = true;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_start_event_name );
 
@@ -2550,6 +2552,7 @@ bool guild_agit_end(void){
 	}
 
 	agit_flag = false;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_end_event_name );
 
@@ -2565,6 +2568,7 @@ bool guild_agit2_start(void){
 	}
 
 	agit2_flag = true;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_start2_event_name );
 
@@ -2580,6 +2584,7 @@ bool guild_agit2_end(void){
 	}
 
 	agit2_flag = false;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_end2_event_name );
 
@@ -2595,6 +2600,7 @@ bool guild_agit3_start(void){
 	}
 
 	agit3_flag = true;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_start3_event_name );
 
@@ -2610,6 +2616,7 @@ bool guild_agit3_end(void){
 	}
 
 	agit3_flag = false;
+	voice_bridge_send_guild_war_state(is_agit_start());
 
 	npc_event_runall( script_config.agit_end3_event_name );
 
