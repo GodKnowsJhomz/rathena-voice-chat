@@ -457,6 +457,7 @@ struct PendingPos {
 // stalls readers while updating x/y/map.  All mutations (auth, close, position
 // update, whisper) acquire a unique_lock (exclusive writer).
 static std::shared_mutex g_session_mtx;
+static std::shared_mutex g_voice_db_config_mtx;
 
 static std::unordered_map<void*, ClientSession*>      g_by_ws;
 static std::unordered_map<int,   ClientSession*>      g_by_char_id;
@@ -532,6 +533,15 @@ static void idx_set_room(ClientSession* s, int v) {
     if (v > 0) g_by_room[v].insert(s);
 }
 
+static bool voice_db_map_blocked(const std::string& map, int level, int job, int group_id) {
+    std::shared_lock<std::shared_mutex> lock(g_voice_db_config_mtx);
+    return g_config.is_map_blocked(map, level, job, group_id);
+}
+
+static bool voice_db_whisper_bypass(int group_id) {
+    std::shared_lock<std::shared_mutex> lock(g_voice_db_config_mtx);
+    return g_config.is_whisper_bypass(group_id);
+}
 
 static bool session_matches(const ClientSession* s, const json& j) {
     if (!s) return false;
@@ -643,8 +653,8 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
     if (from.char_id == to.char_id) return false;
 
     // Block voice on restricted maps — check per-player level/job/group_id
-    if (g_config.is_map_blocked(from.map, from.level, from.job, from.group_id) ||
-        g_config.is_map_blocked(to.map,   to.level,   to.job,   to.group_id))
+    if (voice_db_map_blocked(from.map, from.level, from.job, from.group_id) ||
+        voice_db_map_blocked(to.map,   to.level,   to.job,   to.group_id))
         return false;
 
     const bool war_restricted = g_cfg.war_mode_enabled &&
@@ -804,6 +814,7 @@ static bool udp_secret_allowed(const json& j) {
 
 static void reload_voice_db_config() {
     Config db_cfg = Config::load_voice_db(g_conf_path);
+    std::unique_lock<std::shared_mutex> lock(g_voice_db_config_mtx);
     g_config.blocked_maps = std::move(db_cfg.blocked_maps);
     g_config.whisper_bypass_groups = std::move(db_cfg.whisper_bypass_groups);
 }
@@ -1871,7 +1882,7 @@ void run_server() {
                         clear_existing_whisper(s);
                         std::string sid = g_whisper.request(s->char_id, target_id);
                         s->whisper_sid = sid;
-                        if (g_config.is_whisper_bypass(s->group_id)) {
+                        if (voice_db_whisper_bypass(s->group_id)) {
                             g_whisper.accept(sid, target_id);
                             target->whisper_sid = sid;
                             send_json(target->ws, json{
@@ -1916,7 +1927,7 @@ void run_server() {
                     std::string sid = g_whisper.request(s->char_id, target_id);
                     s->whisper_sid = sid;
 
-                    if (g_config.is_whisper_bypass(s->group_id)) {
+                    if (voice_db_whisper_bypass(s->group_id)) {
                         // GM bypass — auto-accept without notifying target to confirm
                         g_whisper.accept(sid, target_id);
                         target->whisper_sid = sid;
@@ -2171,10 +2182,16 @@ void run_server() {
 
         .close = [](auto* ws, int code, std::string_view) {
             auto* s = ws->getUserData();
+            int log_char_id = 0;
+            int log_account_id = 0;
+            int log_online = 0;
+            uint64_t log_session_id = 0;
+            std::string log_ip;
 
-            // Notify whisper peer on disconnect
             {
-                std::lock_guard<std::shared_mutex> lk2(g_session_mtx);
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+
+                // Notify whisper peer on disconnect
                 if (!s->whisper_sid.empty()) {
                     int peer_id = g_whisper.get_peer(s->whisper_sid, s->char_id);
                     g_whisper.end(s->whisper_sid, s->char_id);
@@ -2184,10 +2201,7 @@ void run_server() {
                         it->second->whisper_sid.clear();
                     }
                 }
-            }
 
-            {
-                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                 idx_remove(s);   // remove from all channel indexes
                 g_by_ws.erase(ws);
                 if (s->char_id != 0) {
@@ -2195,10 +2209,18 @@ void run_server() {
                     if (it != g_by_char_id.end() && it->second == s)
                         g_by_char_id.erase(it);
                 }
-            }
 
-            if (s->authed) g_player_count--;
-            if (g_player_count < 0) g_player_count = 0;
+                if (s->authed)
+                    g_player_count--;
+                if (g_player_count < 0)
+                    g_player_count = 0;
+
+                log_char_id = s->char_id;
+                log_account_id = s->account_id;
+                log_session_id = s->session_id;
+                log_ip = s->ip;
+                log_online = g_player_count;
+            }
 
             const char* reason = (code == 1000) ? "normal"
                                : (code == 1001) ? "going away"
@@ -2206,7 +2228,7 @@ void run_server() {
                                : (code == 1011) ? "server error"
                                : "unknown";
             LOG_INFO("(char_id=%d aid=%d sid=%llu ip=%s) disconnected [%s]  [online: %d]",
-                     s->char_id, s->account_id, static_cast<unsigned long long>(s->session_id), s->ip.c_str(), reason, g_player_count);
+                     log_char_id, log_account_id, static_cast<unsigned long long>(log_session_id), log_ip.c_str(), reason, log_online);
         }
     }).listen(g_cfg.voice_ip.c_str(), g_cfg.voice_port, [](auto* token) {
         if (token) LOG_STATUS("Listening on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);

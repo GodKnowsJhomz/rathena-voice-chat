@@ -168,14 +168,12 @@ void App::close() {
         closesocket(s);
     }
 
-    std::vector<void*> clients;
     {
         std::lock_guard<std::mutex> lock(client_mtx_);
-        clients = active_connections_;
-    }
-    for (void* conn : clients) {
-        if (close_conn_cb_)
-            close_conn_cb_(conn);
+        for (void* conn : active_connections_) {
+            if (close_conn_cb_)
+                close_conn_cb_(conn);
+        }
     }
     Loop::get()->wake();
 }
