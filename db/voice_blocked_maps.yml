@@ -1,0 +1,27 @@
+Header:
+  Type: VOICE_BLOCKED_MAPS
+  Version: 1
+
+# Voice server map restrictions.
+#
+# blocked_maps disables voice routing when either speaker or listener matches a
+# rule. A rule can be just a map name, or a map plus optional filters.
+#
+# Supported optional filters:
+#   min_level: minimum base level
+#   max_level: maximum base level
+#   jobs: [job_id, ...]
+#   group_ids: [group_id, ...]
+#
+# whisper_bypass group_ids skip the whisper accept flow.
+
+blocked_maps:
+  # Examples:
+  # - pvp_y_1-1
+  # - map: prontera
+  #   max_level: 10
+  # - map: guild_vs1
+  #   group_ids: [0]
+
+whisper_bypass:
+  group_ids: []

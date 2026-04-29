@@ -114,10 +114,13 @@ Config Config::load(const std::string& path) {
         return cfg;
     }
 
-    enum class Section { None, BlockedMaps, WhisperBypass };
+    enum class Section { None, Header, BlockedMaps, WhisperBypass };
     Section section = Section::None;
     BlockedMapRule cur;
     bool has_cur = false;
+    std::string header_type;
+    int header_version = 0;
+    bool header_seen = false;
 
     auto commit_rule = [&]() {
         if (has_cur && !cur.map_name.empty())
@@ -135,9 +138,23 @@ Config Config::load(const std::string& path) {
 
         if (line[0] != ' ' && line[0] != '\t' && line[0] != '-') {
             commit_rule();
-            if (tline == "blocked_maps:")           section = Section::BlockedMaps;
+            if (tline == "Header:")                 { section = Section::Header; header_seen = true; }
+            else if (tline == "blocked_maps:")      section = Section::BlockedMaps;
             else if (tline == "whisper_bypass:")    section = Section::WhisperBypass;
             else                                    section = Section::None;
+            continue;
+        }
+
+        if (section == Section::Header) {
+            auto item_sep = tline.find(':');
+            if (item_sep == std::string::npos) continue;
+            std::string k = trim(tline.substr(0, item_sep));
+            std::string v = trim(tline.substr(item_sep + 1));
+            if (k == "Type") {
+                header_type = v;
+            } else if (k == "Version") {
+                try { header_version = std::stoi(v); } catch (...) { header_version = 0; }
+            }
             continue;
         }
 
@@ -182,6 +199,14 @@ Config Config::load(const std::string& path) {
         }
     }
     commit_rule();
+
+    if (!header_seen || header_type != "VOICE_BLOCKED_MAPS" || header_version != 1) {
+        cfg.blocked_maps.clear();
+        cfg.whisper_bypass_groups.clear();
+        std::cerr << "[Config] Invalid " << yml_path
+                  << " Header (expected Type=VOICE_BLOCKED_MAPS Version=1)\n";
+        return cfg;
+    }
 
     std::cout << "[Config] Blocked maps loaded: " << cfg.blocked_maps.size()
               << " rules, bypass groups: " << cfg.whisper_bypass_groups.size() << "\n";
