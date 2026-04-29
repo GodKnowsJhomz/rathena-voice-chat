@@ -333,8 +333,11 @@ static int db_lookup_char_by_name(const std::string& name) {
     return char_id;
 }
 
+struct ClientSession;
+using VoiceSocket = VoiceTcp::Connection<false, true, ClientSession>;
+
 struct ClientSession {
-    uWS::WebSocket<false, true, ClientSession>* ws = nullptr;
+    VoiceSocket* ws = nullptr;
     int account_id = 0;
     int char_id = 0;
     std::string char_name;
@@ -352,7 +355,7 @@ struct ClientSession {
     bool deafened = false;
     bool ptt = false;
 
-    // Advisory grace window — in a cold-start login the DLL's WS auth can race
+    // Advisory grace window — in a cold-start login the DLL's auth can race
     // ahead of the map server's UDP auth_advisory. We accept provisionally and
     // require the advisory to arrive within ADVISORY_GRACE_MS or we kick. If
     // it arrives with a mismatched account_id (real spoof), we kick immediately.
@@ -462,7 +465,7 @@ static int g_player_count = 0;
 
 // ── Auth advisory (populated by Map Server via UDP) ──────────────────────────
 // Map server sends an advisory for each logged-in player with their trusted
-// (account_id) tied to the char_id. WS auth must match or it's rejected.
+// (account_id) tied to the char_id. Client auth must match or it's rejected.
 // This blocks attackers who only know a public char_id but not the paired
 // account_id of a currently-logged-in player.
 struct AuthAdvisory {
@@ -697,25 +700,25 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
 #endif
 
 // Global server loop pointer, set once from the raw TCP server thread before UDP starts.
-static std::atomic<uWS::Loop*> g_uws_loop{nullptr};
+static std::atomic<VoiceTcp::Loop*> g_voice_loop{nullptr};
 
 // Helper: queue a JSON send onto the server loop (thread-safe).
 // We capture stable session identity (char_id + session_id) instead of a raw
 // connection pointer so a disconnect/reconnect cannot leave us sending through
 // a stale connection object after the target session is gone.
 static void send_json_deferred(ClientSession* target, json msg) {
-    if (!g_uws_loop.load()) return;
+    if (!g_voice_loop.load()) return;
     if (!target || target->char_id == 0) return;
     const int target_char_id = target->char_id;
     const uint64_t target_session_id = target->session_id;
     std::string payload = msg.dump();
-    g_uws_loop.load()->defer([target_char_id, target_session_id, payload = std::move(payload)]() {
+    g_voice_loop.load()->defer([target_char_id, target_session_id, payload = std::move(payload)]() {
         std::shared_lock<std::shared_mutex> lock(g_session_mtx);
         auto it = g_by_char_id.find(target_char_id);
         if (it == g_by_char_id.end() || !it->second) return;
         ClientSession* current = it->second;
         if (current->session_id != target_session_id || !current->ws) return;
-        current->ws->send(payload, uWS::OpCode::TEXT);
+        current->ws->send(payload, VoiceTcp::OpCode::TEXT);
     });
 }
 
@@ -778,7 +781,7 @@ static std::thread g_udp_thread;
 static std::atomic<bool> g_udp_running{false};
 static std::atomic<bool> g_server_stop_requested{false};
 static std::atomic<bool> g_server_shutdown_deferred{false};
-static uWS::App* g_app = nullptr;
+static VoiceTcp::App* g_app = nullptr;
 
 static void stop_udp_receiver();
 
@@ -808,7 +811,7 @@ static void reload_voice_db_config() {
 void request_server_stop() {
     g_server_stop_requested.store(true);
 
-    uWS::Loop* loop = g_uws_loop.load();
+    VoiceTcp::Loop* loop = g_voice_loop.load();
     if (loop) {
         if (g_server_shutdown_deferred.exchange(true))
             return;
@@ -853,9 +856,9 @@ static void udp_position_loop() {
         int ret = select(static_cast<int>(g_udp_sock) + 1, &readfds, nullptr, nullptr, &tv);
 
         // Config reload requested by SIGUSR1 — defer to server thread so it's safe
-        if (g_reload_requested.load() && g_uws_loop.load()) {
+        if (g_reload_requested.load() && g_voice_loop.load()) {
             g_reload_requested.store(false);
-            g_uws_loop.load()->defer([]() {
+            g_voice_loop.load()->defer([]() {
                 load_voice_conf(g_conf_path.c_str());
                 reload_voice_db_config();
                 LOG_INFO("Voice config and DB reloaded from %s", g_conf_path.c_str());
@@ -916,9 +919,9 @@ static void udp_position_loop() {
                 }
             }
 
-            if (!advisory_timeout_kicks.empty() && g_uws_loop.load()) {
+            if (!advisory_timeout_kicks.empty() && g_voice_loop.load()) {
                 std::vector<std::pair<int, uint64_t>> victims = std::move(advisory_timeout_kicks);
-                g_uws_loop.load()->defer([victims]() {
+                g_voice_loop.load()->defer([victims]() {
                     for (const auto& [char_id, session_id] : victims) {
                         ClientSession* s = nullptr;
                         {
@@ -931,18 +934,18 @@ static void udp_position_loop() {
                         LOG_WARNING("auth timeout — advisory never arrived  char_id=%d ip=%s (kick)",
                                     s->char_id, s->ip.c_str());
                         s->ws->send(json{{"type","error"},{"message","no active map session"}}.dump(),
-                                    uWS::OpCode::TEXT);
+                                    VoiceTcp::OpCode::TEXT);
                         s->ws->end(1008, "no advisory");
                     }
                 });
             }
 
             // 2. Whisper timeout — notify both peers then drop expired sessions
-            if (g_cfg.whisper_timeout > 0 && g_uws_loop.load()) {
+            if (g_cfg.whisper_timeout > 0 && g_voice_loop.load()) {
                 auto expired = g_whisper.collect_expired(
                     static_cast<int>(g_cfg.whisper_timeout));
                 if (!expired.empty()) {
-                    g_uws_loop.load()->defer([expired = std::move(expired)]() {
+                    g_voice_loop.load()->defer([expired = std::move(expired)]() {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         const std::string payload =
                             json{{"type","whisper_ended"},{"reason","timeout"}}.dump();
@@ -950,7 +953,7 @@ static void udp_position_loop() {
                             for (int cid : {a, b}) {
                                 auto it = g_by_char_id.find(cid);
                                 if (it != g_by_char_id.end() && it->second && it->second->ws) {
-                                    it->second->ws->send(payload, uWS::OpCode::TEXT);
+                                    it->second->ws->send(payload, VoiceTcp::OpCode::TEXT);
                                     it->second->whisper_sid.clear();
                                 }
                             }
@@ -990,7 +993,7 @@ static void udp_position_loop() {
         std::string type = j.value("type", "");
 
         if (type == "reload_config") {
-            g_uws_loop.load()->defer([]() {
+            g_voice_loop.load()->defer([]() {
                 load_voice_conf(g_conf_path.c_str());
                 reload_voice_db_config();
                 LOG_INFO("Voice config and DB reloaded");
@@ -999,7 +1002,7 @@ static void udp_position_loop() {
         }
 
         if (type == "reload_voice_conf") {
-            g_uws_loop.load()->defer([]() {
+            g_voice_loop.load()->defer([]() {
                 load_voice_conf(g_conf_path.c_str());
                 LOG_INFO("Voice config reloaded");
             });
@@ -1007,7 +1010,7 @@ static void udp_position_loop() {
         }
 
         if (type == "reload_voice_db") {
-            g_uws_loop.load()->defer([]() {
+            g_voice_loop.load()->defer([]() {
                 reload_voice_db_config();
                 LOG_INFO("Voice DB reloaded");
             });
@@ -1034,7 +1037,7 @@ static void udp_position_loop() {
             uint32_t l1 = j.value("login_id1", 0u);
             if (cid > 0 && aid > 0) {
                 // Holds the lock only briefly to update the advisory map + check
-                // for matching provisional sessions. Any WS kick is deferred
+                // for matching provisional sessions. Any connection kick is deferred
                 // onto the server loop because ws->end() must run there.
                 int spoof_char_id = 0;
                 uint64_t spoof_session_id = 0;
@@ -1079,13 +1082,13 @@ static void udp_position_loop() {
                 if (confirm_target) {
                     LOG_INFO("auth confirmed via late advisory  char_id=%d aid=%d", cid, aid);
                 }
-                if (spoof_char_id > 0 && g_uws_loop.load()) {
+                if (spoof_char_id > 0 && g_voice_loop.load()) {
                     int cid_cap = cid;
                     int adv_cap = spoof_aid_advisory;
                     int clm_cap = spoof_aid_claimed;
                     int target_char_id = spoof_char_id;
                     uint64_t target_session_id = spoof_session_id;
-                    g_uws_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
+                    g_voice_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
                         ClientSession* target = nullptr;
                         {
                             std::shared_lock<std::shared_mutex> lock(g_session_mtx);
@@ -1097,7 +1100,7 @@ static void udp_position_loop() {
                         LOG_WARNING("auth SPOOF (late advisory) — char_id=%d claimed aid=%d but advisory aid=%d",
                                     cid_cap, clm_cap, adv_cap);
                         target->ws->send(json{{"type","error"},{"message","credentials mismatch"}}.dump(),
-                                         uWS::OpCode::TEXT);
+                                         VoiceTcp::OpCode::TEXT);
                         target->ws->end(1008, "spoof");
                     });
                 }
@@ -1107,11 +1110,11 @@ static void udp_position_loop() {
 
         if (type == "auth_revoke") {
             // Map server says this char is no longer logged in (char-select,
-            // @quit, disconnect). Drop the advisory AND kick the live WS so
+            // @quit, disconnect). Drop the advisory AND kick the live connection so
             // the DLL's reconnect loop picks up a clean session under the
             // new char_id.
             //
-            // Earlier we bailed on the WS kick because map.c calls
+            // Earlier we bailed on the connection kick because map.c calls
             // voice_bridge_send_leave() twice (map_quit + map_deliddb) for
             // the same char_id — two UDP packets, two deferred kicks, and
             // the second one dereferenced a pointer whose session had
@@ -1129,8 +1132,8 @@ static void udp_position_loop() {
                 g_auth_advisories.erase(cid);
             }
 
-            if (g_uws_loop.load()) {
-                g_uws_loop.load()->defer([cid]() {
+            if (g_voice_loop.load()) {
+                g_voice_loop.load()->defer([cid]() {
                     // Step 1: lookup + set `kicking` flag under the session lock.
                     // We deliberately keep `authed` untouched here — the close
                     // handler below reads it to decrement g_player_count, and if
@@ -1146,7 +1149,7 @@ static void udp_position_loop() {
                         target = it->second;
                         target->kicking = true;   // second auth_revoke will see this and bail
                     }
-                    // Step 2: close the WS OUTSIDE the lock. ws->end() triggers
+                    // Step 2: close the connection OUTSIDE the lock. ws->end() triggers
                     // our close handler synchronously on this same server loop
                     // thread, and that handler re-acquires g_session_mtx — holding
                     // it here would deadlock. Since we're on the server thread and
@@ -1154,7 +1157,7 @@ static void udp_position_loop() {
                     // valid across these two calls.
                     LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing connection", cid);
                     target->ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
-                                     uWS::OpCode::TEXT);
+                                     VoiceTcp::OpCode::TEXT);
                     target->ws->end(1000, "map logoff");
                 });
             }
@@ -1388,8 +1391,8 @@ static std::string normalize_ip(std::string_view raw) {
     return s;
 }
 
-static void send_json(uWS::WebSocket<false, true, ClientSession>* ws, const json& j) {
-    ws->send(j.dump(), uWS::OpCode::TEXT);
+static void send_json(VoiceSocket* ws, const json& j) {
+    ws->send(j.dump(), VoiceTcp::OpCode::TEXT);
 }
 
 static size_t audio_backpressure_limit_bytes() {
@@ -1486,8 +1489,8 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
     h[41] = static_cast<unsigned char>( seq       & 0xFF);
     std::memcpy(&out[42], pcm, pcm_bytes);
 
-    auto status = to->ws->send(out, uWS::OpCode::BINARY);
-    if (status == uWS::WebSocket<false, true, ClientSession>::DROPPED) {
+    auto status = to->ws->send(out, VoiceTcp::OpCode::BINARY);
+    if (status == VoiceSocket::DROPPED) {
         to->audio_backpressure_drops++;
         return false;
     }
@@ -1534,7 +1537,7 @@ void run_server() {
 
     // Capture the server loop before any clients connect so Ctrl+C/SIGTERM can
     // always defer shutdown work onto the event-loop thread.
-    g_uws_loop.store(uWS::Loop::get());
+    g_voice_loop.store(VoiceTcp::Loop::get());
     if (g_server_stop_requested.load())
         request_server_stop();
 
@@ -1543,9 +1546,9 @@ void run_server() {
         LOG_WARNING("UDP receiver failed to start — positions from Map Server will not work");
     }
 
-    uWS::App app;
+    VoiceTcp::App app;
     g_app = &app;
-    app.ws<ClientSession>("/*", {
+    app.connection<ClientSession>("/*", {
         .maxPayloadLength = 2048,
         .maxBackpressure = 64 * 1024,
         .closeOnBackpressureLimit = false,
@@ -1581,10 +1584,10 @@ void run_server() {
             LOG_STATUS("connection from %s", s->ip.c_str());
         },
 
-        .message = [](auto* ws, std::string_view message, uWS::OpCode opCode) {
+        .message = [](auto* ws, std::string_view message, VoiceTcp::OpCode opCode) {
             auto* s = ws->getUserData();
 
-            if (opCode == uWS::OpCode::TEXT) {
+            if (opCode == VoiceTcp::OpCode::TEXT) {
                 json j;
                 try {
                     j = json::parse(message);
@@ -1613,9 +1616,9 @@ void run_server() {
                     // `s->char_id` in place and leave orphan entries in
                     // g_by_char_id pointing to the same session (online count
                     // keeps climbing: 1 → 2 → 3 …). Kick instead so the DLL
-                    // reconnects cleanly — the new WS will then run through
+                    // reconnects cleanly — the new connection will then run through
                     // the "one char per account" stale-session sweep below and
-                    // see the old WS as a separate `other` pointer.
+                    // see the old connection as a separate `other` pointer.
                     const int      new_aid = j.value("account_id", 0);
                     const int      new_cid = j.value("char_id", 0);
                     const uint64_t new_sid = j.value("session_id", static_cast<uint64_t>(0));
@@ -1640,7 +1643,7 @@ void run_server() {
 
                     // ── Verify against Map Server advisory (anti-spoofing) ────
                     // Map server broadcasts (char_id, account_id) on login + every
-                    // 30 s. On cold start the DLL's WS auth can arrive before the
+                    // 30 s. On cold start the DLL's auth can arrive before the
                     // first UDP advisory packet does; we accept provisionally and
                     // wait up to ADVISORY_GRACE_MS for the advisory. The maintenance
                     // loop kicks sessions whose advisory never arrives. A mismatched
@@ -1708,7 +1711,7 @@ void run_server() {
                         // An RO account can only own one logged-in character at
                         // a time, so any OTHER session with the same account_id
                         // (but a different char_id) is a stale ghost — usually
-                        // a DLL that forgot to close its previous WS after the
+                        // a DLL that forgot to close its previous connection after the
                         // user switched character without restarting the client.
                         // Kick those before we replace the char_id slot below.
                         int  stale_account_kicks = 0;
@@ -2022,7 +2025,7 @@ void run_server() {
                 return;
             }
 
-            if (opCode == uWS::OpCode::BINARY) {
+            if (opCode == VoiceTcp::OpCode::BINARY) {
                 if (!s->authed) {
                     send_json(ws, json{{"type", "error"}, {"message", "binary before auth"}});
                     return;
@@ -2218,5 +2221,5 @@ void run_server() {
         }
     }
     g_app = nullptr;
-    g_uws_loop.store(nullptr);
+    g_voice_loop.store(nullptr);
 }

@@ -28,7 +28,7 @@
 #  define closesocket(s) ::close(s)
 #endif
 
-namespace uWS {
+namespace VoiceTcp {
 
 enum class OpCode {
     TEXT,
@@ -50,7 +50,7 @@ private:
 };
 
 template <bool, bool, typename UserData>
-class WebSocket {
+class Connection {
 public:
     enum SendStatus {
         SUCCESS,
@@ -58,8 +58,8 @@ public:
         DROPPED
     };
 
-    WebSocket(SOCKET s, std::string ip) : socket_(s), remote_ip_(std::move(ip)) {}
-    ~WebSocket() { close_socket(); }
+    Connection(SOCKET s, std::string ip) : socket_(s), remote_ip_(std::move(ip)) {}
+    ~Connection() { close_socket(); }
 
     UserData* getUserData() { return &user_data_; }
     std::string_view getRemoteAddressAsText() const { return remote_ip_; }
@@ -83,13 +83,13 @@ private:
 };
 
 template <typename UserData>
-struct WebSocketBehavior {
+struct ConnectionBehavior {
     unsigned int maxPayloadLength = 0;
     unsigned int maxBackpressure = 0;
     bool closeOnBackpressureLimit = false;
-    std::function<void(WebSocket<false, true, UserData>*)> open;
-    std::function<void(WebSocket<false, true, UserData>*, std::string_view, OpCode)> message;
-    std::function<void(WebSocket<false, true, UserData>*, int, std::string_view)> close;
+    std::function<void(Connection<false, true, UserData>*)> open;
+    std::function<void(Connection<false, true, UserData>*, std::string_view, OpCode)> message;
+    std::function<void(Connection<false, true, UserData>*, int, std::string_view)> close;
 };
 
 class App {
@@ -98,23 +98,23 @@ public:
     ~App();
 
     template <typename UserData>
-    App& ws(const char*, WebSocketBehavior<UserData> behavior) {
-        using Ws = WebSocket<false, true, UserData>;
+    App& connection(const char*, ConnectionBehavior<UserData> behavior) {
+        using Conn = Connection<false, true, UserData>;
         max_payload_ = behavior.maxPayloadLength ? behavior.maxPayloadLength : max_payload_;
 
-        open_cb_ = [open = std::move(behavior.open)](void* ws) {
-            if (open) open(static_cast<Ws*>(ws));
+        open_cb_ = [open = std::move(behavior.open)](void* conn) {
+            if (open) open(static_cast<Conn*>(conn));
         };
-        message_cb_ = [message = std::move(behavior.message)](void* ws, std::string_view data, OpCode op) {
-            if (message) message(static_cast<Ws*>(ws), data, op);
+        message_cb_ = [message = std::move(behavior.message)](void* conn, std::string_view data, OpCode op) {
+            if (message) message(static_cast<Conn*>(conn), data, op);
         };
-        close_cb_ = [close = std::move(behavior.close)](void* ws, int code, std::string_view reason) {
-            if (close) close(static_cast<Ws*>(ws), code, reason);
+        close_cb_ = [close = std::move(behavior.close)](void* conn, int code, std::string_view reason) {
+            if (close) close(static_cast<Conn*>(conn), code, reason);
         };
-        delete_cb_ = [](void* ws) { delete static_cast<Ws*>(ws); };
-        socket_cb_ = [](void* ws) { return static_cast<Ws*>(ws)->socket(); };
-        close_ws_cb_ = [](void* ws) { static_cast<Ws*>(ws)->close_socket(); };
-        make_ws_cb_ = [](SOCKET s, std::string ip) -> void* { return new Ws(s, std::move(ip)); };
+        delete_cb_ = [](void* conn) { delete static_cast<Conn*>(conn); };
+        socket_cb_ = [](void* conn) { return static_cast<Conn*>(conn)->socket(); };
+        close_conn_cb_ = [](void* conn) { static_cast<Conn*>(conn)->close_socket(); };
+        make_conn_cb_ = [](SOCKET s, std::string ip) -> void* { return new Conn(s, std::move(ip)); };
         return *this;
     }
 
@@ -124,41 +124,41 @@ public:
 
 private:
     void accept_loop();
-    void client_loop(void* ws);
+    void client_loop(void* conn);
 
     SOCKET listen_socket_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
     std::thread accept_thread_;
     std::vector<std::thread> client_threads_;
-    std::vector<void*> active_ws_;
+    std::vector<void*> active_connections_;
     std::mutex client_mtx_;
 
     uint32_t max_payload_ = 1024 * 1024;
-    std::function<void*(SOCKET, std::string)> make_ws_cb_;
+    std::function<void*(SOCKET, std::string)> make_conn_cb_;
     std::function<SOCKET(void*)> socket_cb_;
     std::function<void(void*)> open_cb_;
     std::function<void(void*, std::string_view, OpCode)> message_cb_;
     std::function<void(void*, int, std::string_view)> close_cb_;
     std::function<void(void*)> delete_cb_;
-    std::function<void(void*)> close_ws_cb_;
+    std::function<void(void*)> close_conn_cb_;
 };
 
 template <bool A, bool B, typename UserData>
-typename WebSocket<A, B, UserData>::SendStatus WebSocket<A, B, UserData>::send(std::string_view data, OpCode op) {
+typename Connection<A, B, UserData>::SendStatus Connection<A, B, UserData>::send(std::string_view data, OpCode op) {
     const uint8_t type = (op == OpCode::TEXT) ? 1 : 2;
     return send_frame(type, reinterpret_cast<const uint8_t*>(data.data()),
                       static_cast<uint32_t>(data.size())) ? SUCCESS : DROPPED;
 }
 
 template <bool A, bool B, typename UserData>
-void WebSocket<A, B, UserData>::end(int, std::string_view) {
+void Connection<A, B, UserData>::end(int, std::string_view) {
     if (socket_ != INVALID_SOCKET)
         send_frame(3, nullptr, 0);
     close_socket();
 }
 
 template <bool A, bool B, typename UserData>
-void WebSocket<A, B, UserData>::close_socket() {
+void Connection<A, B, UserData>::close_socket() {
     if (closed_.exchange(true))
         return;
     std::lock_guard<std::mutex> lock(send_mtx_);
@@ -175,7 +175,7 @@ void WebSocket<A, B, UserData>::close_socket() {
 }
 
 template <bool A, bool B, typename UserData>
-bool WebSocket<A, B, UserData>::send_frame(uint8_t type, const uint8_t* data, uint32_t len) {
+bool Connection<A, B, UserData>::send_frame(uint8_t type, const uint8_t* data, uint32_t len) {
     std::lock_guard<std::mutex> lock(send_mtx_);
     if (closed_.load() || socket_ == INVALID_SOCKET)
         return false;
@@ -204,4 +204,4 @@ bool WebSocket<A, B, UserData>::send_frame(uint8_t type, const uint8_t* data, ui
     return send_all(header, sizeof(header)) && (len == 0 || send_all(data, len));
 }
 
-} // namespace uWS
+} // namespace VoiceTcp

@@ -7,7 +7,7 @@
 using socklen_t = int;
 #endif
 
-namespace uWS {
+namespace VoiceTcp {
 namespace {
 
 constexpr uint16_t RAW_MAGIC = 0x5654;
@@ -171,11 +171,11 @@ void App::close() {
     std::vector<void*> clients;
     {
         std::lock_guard<std::mutex> lock(client_mtx_);
-        clients = active_ws_;
+        clients = active_connections_;
     }
-    for (void* ws : clients) {
-        if (close_ws_cb_)
-            close_ws_cb_(ws);
+    for (void* conn : clients) {
+        if (close_conn_cb_)
+            close_conn_cb_(conn);
     }
     Loop::get()->wake();
 }
@@ -191,26 +191,26 @@ void App::accept_loop() {
             continue;
         }
 
-        if (!make_ws_cb_) {
+        if (!make_conn_cb_) {
             closesocket(client);
             continue;
         }
 
-        void* ws = make_ws_cb_(client, sockaddr_to_ip(from));
+        void* conn = make_conn_cb_(client, sockaddr_to_ip(from));
         {
             std::lock_guard<std::mutex> lock(client_mtx_);
-            active_ws_.push_back(ws);
-            client_threads_.emplace_back([this, ws] { client_loop(ws); });
+            active_connections_.push_back(conn);
+            client_threads_.emplace_back([this, conn] { client_loop(conn); });
         }
     }
 }
 
-void App::client_loop(void* ws) {
+void App::client_loop(void* conn) {
     int close_code = 1006;
     if (open_cb_)
-        open_cb_(ws);
+        open_cb_(conn);
 
-    SOCKET s = socket_cb_ ? socket_cb_(ws) : INVALID_SOCKET;
+    SOCKET s = socket_cb_ ? socket_cb_(conn) : INVALID_SOCKET;
     while (running_.load() && s != INVALID_SOCKET) {
         uint8_t header[8] = {};
         if (!recv_all(s, header, sizeof(header)))
@@ -229,7 +229,7 @@ void App::client_loop(void* ws) {
 
         if (type == 1 || type == 2) {
             if (message_cb_)
-                message_cb_(ws, payload, type == 1 ? OpCode::TEXT : OpCode::BINARY);
+                message_cb_(conn, payload, type == 1 ? OpCode::TEXT : OpCode::BINARY);
         } else if (type == 3) {
             close_code = 1000;
             break;
@@ -237,17 +237,17 @@ void App::client_loop(void* ws) {
             break;
         }
 
-        s = socket_cb_ ? socket_cb_(ws) : INVALID_SOCKET;
+        s = socket_cb_ ? socket_cb_(conn) : INVALID_SOCKET;
     }
 
     if (close_cb_)
-        close_cb_(ws, close_code, {});
+        close_cb_(conn, close_code, {});
     {
         std::lock_guard<std::mutex> lock(client_mtx_);
-        active_ws_.erase(std::remove(active_ws_.begin(), active_ws_.end(), ws), active_ws_.end());
+        active_connections_.erase(std::remove(active_connections_.begin(), active_connections_.end(), conn), active_connections_.end());
     }
     if (delete_cb_)
-        delete_cb_(ws);
+        delete_cb_(conn);
 }
 
-} // namespace uWS
+} // namespace VoiceTcp
