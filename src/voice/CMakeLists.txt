@@ -31,7 +31,7 @@ set( VOICE_INCLUDE_DIRS
 set( VOICE_SOURCES
 	${VOICE_SOURCE_DIR}/config.cpp
 	${VOICE_SOURCE_DIR}/main.cpp
-	${VOICE_SOURCE_DIR}/raw_tcp_server.cpp
+	${VOICE_SOURCE_DIR}/voice_transport.cpp
 	${VOICE_SOURCE_DIR}/room_manager.cpp
 	${VOICE_SOURCE_DIR}/server.cpp
 	${VOICE_SOURCE_DIR}/whisper_manager.cpp
@@ -40,7 +40,7 @@ set( VOICE_SOURCES
 set( VOICE_HEADERS
 	${VOICE_SOURCE_DIR}/config.hpp
 	${VOICE_SOURCE_DIR}/player.hpp
-	${VOICE_SOURCE_DIR}/raw_tcp_server.hpp
+	${VOICE_SOURCE_DIR}/voice_transport.hpp
 	${VOICE_SOURCE_DIR}/room_manager.hpp
 	${VOICE_SOURCE_DIR}/whisper_manager.hpp
 )

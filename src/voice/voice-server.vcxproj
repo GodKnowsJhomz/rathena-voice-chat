@@ -169,7 +169,7 @@
   <ItemGroup>
     <ClCompile Include="config.cpp" />
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="raw_tcp_server.cpp" />
+    <ClCompile Include="voice_transport.cpp" />
     <ClCompile Include="room_manager.cpp" />
     <ClCompile Include="server.cpp">
       <DisableSpecificWarnings>4244;%(DisableSpecificWarnings)</DisableSpecificWarnings>
@@ -179,7 +179,7 @@
   <ItemGroup>
     <ClInclude Include="config.hpp" />
     <ClInclude Include="player.hpp" />
-    <ClInclude Include="raw_tcp_server.hpp" />
+    <ClInclude Include="voice_transport.hpp" />
     <ClInclude Include="room_manager.hpp" />
     <ClInclude Include="whisper_manager.hpp" />
   </ItemGroup>
