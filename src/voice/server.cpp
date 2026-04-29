@@ -777,6 +777,7 @@ static SOCKET g_udp_sock = INVALID_SOCKET;
 static std::thread g_udp_thread;
 static std::atomic<bool> g_udp_running{false};
 static std::atomic<bool> g_server_stop_requested{false};
+static std::atomic<bool> g_server_shutdown_deferred{false};
 static uWS::App* g_app = nullptr;
 
 static void stop_udp_receiver();
@@ -799,11 +800,12 @@ static bool udp_secret_allowed(const json& j) {
 }
 
 void request_server_stop() {
-    if (g_server_stop_requested.exchange(true))
-        return;
+    g_server_stop_requested.store(true);
 
     uWS::Loop* loop = g_uws_loop.load();
     if (loop) {
+        if (g_server_shutdown_deferred.exchange(true))
+            return;
         loop->defer([]() {
             LOG_INFO("Shutdown requested");
             stop_udp_receiver();
@@ -1506,6 +1508,12 @@ void run_server() {
         LOG_WARNING("DB not available — party/guild channels will not work until connected");
     }
 
+    // Capture the uWS loop before any clients connect so Ctrl+C/SIGTERM can
+    // always defer shutdown work onto the event-loop thread.
+    g_uws_loop.store(uWS::Loop::get());
+    if (g_server_stop_requested.load())
+        request_server_stop();
+
     // Start UDP receiver for position from Map Server
     if (!init_udp_receiver()) {
         LOG_WARNING("UDP receiver failed to start — positions from Map Server will not work");
@@ -1518,8 +1526,6 @@ void run_server() {
         .maxBackpressure = 64 * 1024,
         .closeOnBackpressureLimit = false,
         .open = [](auto* ws) {
-            // Capture the uWS loop once so UDP thread can defer sends
-            if (!g_uws_loop.load()) g_uws_loop.store(uWS::Loop::get());
             auto* s = ws->getUserData();
             s->ws = ws;
             std::string ip = normalize_ip(ws->getRemoteAddressAsText());
@@ -2188,4 +2194,5 @@ void run_server() {
         }
     }
     g_app = nullptr;
+    g_uws_loop.store(nullptr);
 }
