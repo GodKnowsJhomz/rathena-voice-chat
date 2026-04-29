@@ -19,6 +19,7 @@ set "login_running=false"
 set "char_running=false"
 set "web_running=false"
 set "map_running=false"
+set "voice_running=false"
 
 
 if "%target%" == "status" (
@@ -39,6 +40,7 @@ call :stopLogin
 call :stopChar
 call :stopWeb
 call :stopMap
+call :stopVoice
 goto :EOF
 
 :Watch
@@ -49,6 +51,7 @@ call :startLogin
 call :startChar
 call :startWeb
 call :startMap
+call :startVoice
 goto :EOF
 
 :Start
@@ -58,6 +61,7 @@ call :startLogin
 call :startChar
 call :startWeb
 call :startMap
+call :startVoice
 goto :EOF
 
 :getStatus
@@ -66,6 +70,7 @@ call :getLoginStatus
 call :getCharStatus
 call :getWebStatus
 call :getMapStatus
+call :getVoiceStatus
 
 if "%login_running%" == "false" ( echo "login_serv is not running"
 ) else echo "login_serv is running pid=%LoginServPID%"
@@ -75,6 +80,8 @@ if "%web_running%" == "false" ( echo "web_serv is not running"
 ) else echo "web_serv is running pid=%WebServPID%"
 if "%map_running%" == "false" ( echo "map_serv is not running"
 ) else echo "map_serv is running pid=%MapServPID%"
+if "%voice_running%" == "false" ( echo "voice_serv is not running"
+) else echo "voice_serv is running pid=%VoiceServPID%"
 
 goto :EOF
 
@@ -105,6 +112,11 @@ call :getMapStatus
 if "%map_running%" == "true" Taskkill /PID %MapServPID% /F
 goto :EOF
 
+:stopVoice
+call :getVoiceStatus
+if "%voice_running%" == "true" Taskkill /PID %VoiceServPID% /F
+goto :EOF
+
 REM start sub targets
 :startLogin
 call :getLoginStatus
@@ -130,6 +142,12 @@ if "%map_running%" == "false" ( start cmd /k mapserv.bat %restart_mode%
 ) else echo "Map serv is already running, pid=%MapServPID%"
 goto :EOF
 
+:startVoice
+call :getVoiceStatus
+if "%voice_running%" == "false" ( start cmd /k voiceserv.bat %restart_mode%
+) else echo "Voice serv is already running, pid=%VoiceServPID%"
+goto :EOF
+
 REM status sub targets
 
 :getLoginStatus
@@ -150,4 +168,9 @@ goto :EOF
 :getMapStatus
 for /F "TOKENS=1,2,*" %%a in ('tasklist /FI "IMAGENAME eq map-server.exe"') do set MapServPID=%%b
 echo(%MapServPID%|findstr "^[-][1-9][0-9]*$ ^[1-9][0-9]*$ ^0$">nul&& set "map_running=true" || set "map_running=false"
+goto :EOF
+
+:getVoiceStatus
+for /F "TOKENS=1,2,*" %%a in ('tasklist /FI "IMAGENAME eq voice-server.exe"') do set VoiceServPID=%%b
+echo(%VoiceServPID%|findstr "^[-][1-9][0-9]*$ ^[1-9][0-9]*$ ^0$">nul&& set "voice_running=true" || set "voice_running=false"
 goto :EOF
