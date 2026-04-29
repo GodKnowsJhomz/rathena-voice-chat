@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -58,28 +59,40 @@ public:
         DROPPED
     };
 
-    Connection(SOCKET s, std::string ip) : socket_(s), remote_ip_(std::move(ip)) {}
+    Connection(SOCKET s, std::string ip) : socket_(s), remote_ip_(std::move(ip)) {
+        send_thread_ = std::thread([this] { send_loop(); });
+    }
     ~Connection() { close_socket(); }
 
     UserData* getUserData() { return &user_data_; }
     std::string_view getRemoteAddressAsText() const { return remote_ip_; }
-    unsigned int getBufferedAmount() const { return 0; }
+    unsigned int getBufferedAmount() const {
+        const size_t bytes = queued_bytes_.load();
+        return bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : static_cast<unsigned int>(bytes);
+    }
 
     SendStatus send(std::string_view data, OpCode op);
     void end(int code, std::string_view reason);
     void close_socket();
 
-    SOCKET socket() const { return socket_; }
+    SOCKET socket() const { return socket_.load(); }
     bool is_closed() const { return closed_.load(); }
 
 private:
-    bool send_frame(uint8_t type, const uint8_t* data, uint32_t len);
+    SendStatus send_frame(uint8_t type, const uint8_t* data, uint32_t len);
+    void send_loop();
+    bool send_all(const char* data, size_t len);
 
-    SOCKET socket_ = INVALID_SOCKET;
+    std::atomic<SOCKET> socket_{INVALID_SOCKET};
     std::string remote_ip_;
     UserData user_data_{};
     std::atomic<bool> closed_{false};
-    std::mutex send_mtx_;
+    std::thread send_thread_;
+    std::mutex queue_mtx_;
+    std::condition_variable queue_cv_;
+    std::deque<std::string> send_queue_;
+    std::atomic<size_t> queued_bytes_{0};
+    static constexpr size_t MAX_QUEUED_BYTES = 1024 * 1024;
 };
 
 template <typename UserData>
@@ -147,61 +160,114 @@ template <bool A, bool B, typename UserData>
 typename Connection<A, B, UserData>::SendStatus Connection<A, B, UserData>::send(std::string_view data, OpCode op) {
     const uint8_t type = (op == OpCode::TEXT) ? 1 : 2;
     return send_frame(type, reinterpret_cast<const uint8_t*>(data.data()),
-                      static_cast<uint32_t>(data.size())) ? SUCCESS : DROPPED;
+                      static_cast<uint32_t>(data.size()));
 }
 
 template <bool A, bool B, typename UserData>
 void Connection<A, B, UserData>::end(int, std::string_view) {
-    if (socket_ != INVALID_SOCKET)
+    if (socket_.load() != INVALID_SOCKET)
         send_frame(3, nullptr, 0);
     close_socket();
 }
 
 template <bool A, bool B, typename UserData>
 void Connection<A, B, UserData>::close_socket() {
-    if (closed_.exchange(true))
-        return;
-    std::lock_guard<std::mutex> lock(send_mtx_);
-    SOCKET s = socket_;
-    socket_ = INVALID_SOCKET;
-    if (s != INVALID_SOCKET) {
+    const bool was_open = !closed_.exchange(true);
+    if (was_open) {
+        SOCKET s = socket_.exchange(INVALID_SOCKET);
+        if (s != INVALID_SOCKET) {
 #ifdef _WIN32
-        shutdown(s, SD_BOTH);
+            shutdown(s, SD_BOTH);
 #else
-        shutdown(s, SHUT_RDWR);
+            shutdown(s, SHUT_RDWR);
 #endif
-        closesocket(s);
+            closesocket(s);
+        }
+    }
+    queue_cv_.notify_all();
+    if (send_thread_.joinable() && send_thread_.get_id() != std::this_thread::get_id())
+        send_thread_.join();
+}
+
+template <bool A, bool B, typename UserData>
+typename Connection<A, B, UserData>::SendStatus Connection<A, B, UserData>::send_frame(uint8_t type, const uint8_t* data, uint32_t len) {
+    if (closed_.load() || socket_.load() == INVALID_SOCKET)
+        return DROPPED;
+
+    std::string frame;
+    frame.resize(8 + len);
+    auto* h = reinterpret_cast<uint8_t*>(&frame[0]);
+    h[0] = 0x56;
+    h[1] = 0x54;
+    h[2] = 0x01;
+    h[3] = type;
+    h[4] = static_cast<uint8_t>((len >> 24) & 0xFF);
+    h[5] = static_cast<uint8_t>((len >> 16) & 0xFF);
+    h[6] = static_cast<uint8_t>((len >> 8) & 0xFF);
+    h[7] = static_cast<uint8_t>(len & 0xFF);
+    if (len && data)
+        std::memcpy(frame.data() + 8, data, len);
+
+    const size_t frame_size = frame.size();
+    std::lock_guard<std::mutex> lock(queue_mtx_);
+    if (closed_.load() || socket_.load() == INVALID_SOCKET)
+        return DROPPED;
+    if (queued_bytes_.load() + frame_size > MAX_QUEUED_BYTES)
+        return BACKPRESSURE;
+    send_queue_.push_back(std::move(frame));
+    queued_bytes_.fetch_add(frame_size);
+    queue_cv_.notify_one();
+    return SUCCESS;
+}
+
+template <bool A, bool B, typename UserData>
+void Connection<A, B, UserData>::send_loop() {
+    while (true) {
+        std::string frame;
+        {
+            std::unique_lock<std::mutex> lock(queue_mtx_);
+            queue_cv_.wait(lock, [this] { return closed_.load() || !send_queue_.empty(); });
+            if (send_queue_.empty()) {
+                if (closed_.load())
+                    break;
+                continue;
+            }
+            frame = std::move(send_queue_.front());
+            send_queue_.pop_front();
+            queued_bytes_.fetch_sub(frame.size());
+        }
+
+        if (!send_all(frame.data(), frame.size())) {
+            SOCKET s = socket_.exchange(INVALID_SOCKET);
+            if (s != INVALID_SOCKET) {
+#ifdef _WIN32
+                shutdown(s, SD_BOTH);
+#else
+                shutdown(s, SHUT_RDWR);
+#endif
+                closesocket(s);
+            }
+            closed_.store(true);
+            queue_cv_.notify_all();
+            break;
+        }
     }
 }
 
 template <bool A, bool B, typename UserData>
-bool Connection<A, B, UserData>::send_frame(uint8_t type, const uint8_t* data, uint32_t len) {
-    std::lock_guard<std::mutex> lock(send_mtx_);
-    if (closed_.load() || socket_ == INVALID_SOCKET)
-        return false;
-
-    uint8_t header[8] = {
-        0x56, 0x54,
-        0x01,
-        type,
-        static_cast<uint8_t>((len >> 24) & 0xFF),
-        static_cast<uint8_t>((len >> 16) & 0xFF),
-        static_cast<uint8_t>((len >> 8) & 0xFF),
-        static_cast<uint8_t>(len & 0xFF)
-    };
-
-    auto send_all = [this](const uint8_t* p, size_t n) {
-        size_t sent = 0;
-        while (sent < n) {
-            int rc = ::send(socket_, reinterpret_cast<const char*>(p + sent),
-                            static_cast<int>(std::min<size_t>(n - sent, 64 * 1024)), 0);
-            if (rc <= 0) return false;
-            sent += static_cast<size_t>(rc);
-        }
-        return true;
-    };
-
-    return send_all(header, sizeof(header)) && (len == 0 || send_all(data, len));
+bool Connection<A, B, UserData>::send_all(const char* data, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        SOCKET s = socket_.load();
+        if (closed_.load() || s == INVALID_SOCKET)
+            return false;
+        int rc = ::send(s, data + sent,
+                        static_cast<int>(std::min<size_t>(len - sent, 64 * 1024)), 0);
+        if (rc <= 0)
+            return false;
+        sent += static_cast<size_t>(rc);
+    }
+    return true;
 }
 
 } // namespace VoiceTcp

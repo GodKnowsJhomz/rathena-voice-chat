@@ -1501,7 +1501,7 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
     std::memcpy(&out[42], pcm, pcm_bytes);
 
     auto status = to->ws->send(out, VoiceTcp::OpCode::BINARY);
-    if (status == VoiceSocket::DROPPED) {
+    if (status != VoiceSocket::SUCCESS) {
         to->audio_backpressure_drops++;
         return false;
     }
