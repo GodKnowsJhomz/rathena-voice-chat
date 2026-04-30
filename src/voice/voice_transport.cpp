@@ -13,6 +13,7 @@ namespace {
 constexpr uint16_t RAW_MAGIC = 0x5654;
 constexpr uint8_t RAW_VERSION = 1;
 constexpr uint32_t RAW_MAX_PAYLOAD = 1024 * 1024;
+constexpr int PRE_AUTH_RECV_TIMEOUT_MS = 15000;
 
 static uint16_t read_u16_be(const uint8_t* p) {
     return static_cast<uint16_t>((p[0] << 8) | p[1]);
@@ -178,6 +179,19 @@ void App::close() {
     Loop::get()->wake();
 }
 
+static void set_recv_timeout(SOCKET s, int timeout_ms) {
+#ifdef _WIN32
+    DWORD timeout = static_cast<DWORD>(timeout_ms);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    timeval tv{};
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 void App::accept_loop() {
     while (running_.load()) {
         sockaddr_in from{};
@@ -194,6 +208,7 @@ void App::accept_loop() {
             continue;
         }
 
+        set_recv_timeout(client, PRE_AUTH_RECV_TIMEOUT_MS);
         void* conn = make_conn_cb_(client, sockaddr_to_ip(from));
         {
             std::lock_guard<std::mutex> lock(client_mtx_);
@@ -209,6 +224,7 @@ void App::client_loop(void* conn) {
         open_cb_(conn);
 
     SOCKET s = socket_cb_ ? socket_cb_(conn) : INVALID_SOCKET;
+    bool first_frame = true;
     while (running_.load() && s != INVALID_SOCKET) {
         uint8_t header[8] = {};
         if (!recv_all(s, header, sizeof(header)))
@@ -224,6 +240,11 @@ void App::client_loop(void* conn) {
         std::string payload(len, '\0');
         if (len && !recv_all(s, reinterpret_cast<uint8_t*>(payload.data()), len))
             break;
+
+        if (first_frame) {
+            first_frame = false;
+            set_recv_timeout(s, 0);
+        }
 
         if (type == 1 || type == 2) {
             if (message_cb_)
