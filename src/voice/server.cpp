@@ -870,9 +870,14 @@ static bool udp_secret_allowed(const json& j) {
 
 static void reload_voice_db_config() {
     Config db_cfg = Config::load_voice_db(g_conf_path);
+    if (!db_cfg.voice_db_valid) {
+        LOG_ERROR("Voice DB reload failed; keeping previous blocked map rules");
+        return;
+    }
     std::unique_lock<std::shared_mutex> lock(g_voice_db_config_mtx);
     g_config.blocked_maps = std::move(db_cfg.blocked_maps);
     g_config.whisper_bypass_groups = std::move(db_cfg.whisper_bypass_groups);
+    g_config.voice_db_valid = true;
 }
 
 void request_server_stop() {
@@ -901,7 +906,7 @@ void request_server_stop() {
 }
 
 static void udp_position_loop() {
-    char buf[1024];
+    char buf[4096];
     sockaddr_in from_addr{};
     sock_len_t from_len = sizeof(from_addr);
 
@@ -939,7 +944,7 @@ static void udp_position_loop() {
             last_speaking_maintenance = now_maint;
             std::vector<int> speaking_hat_off;
             {
-                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                std::shared_lock<std::shared_mutex> lock(g_session_mtx);
                 const uint32_t speaking_timeout = static_cast<uint32_t>(std::max(100, g_cfg.speaking_hat_timeout_ms));
                 for (auto& kv : g_by_char_id) {
                     ClientSession* s = kv.second;

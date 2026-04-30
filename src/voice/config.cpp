@@ -50,6 +50,7 @@ static std::vector<int> parse_int_list(const std::string& s) {
 static void load_voice_db_from_conf(Config& cfg, const std::string& path) {
     cfg.blocked_maps.clear();
     cfg.whisper_bypass_groups.clear();
+    cfg.voice_db_valid = false;
 
     std::string dir = path;
     auto slash = dir.find_last_of("/\\");
@@ -156,6 +157,7 @@ static void load_voice_db_from_conf(Config& cfg, const std::string& path) {
         return;
     }
 
+    cfg.voice_db_valid = true;
     std::cout << "[Config] Blocked maps loaded: " << cfg.blocked_maps.size()
               << " rules, bypass groups: " << cfg.whisper_bypass_groups.size() << "\n";
 }

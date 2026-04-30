@@ -34,6 +34,7 @@ struct Config {
 
     std::vector<BlockedMapRule>  blocked_maps;
     std::unordered_set<int>      whisper_bypass_groups; // group_ids that skip whisper accept
+    bool                         voice_db_valid = false;
 
     // Returns true if voice should be blocked for this player on this map
     bool is_map_blocked(const std::string& map, int level = -1, int job = -1, int group_id = -1) const {
