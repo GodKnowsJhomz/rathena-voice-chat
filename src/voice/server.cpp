@@ -1951,41 +1951,44 @@ void run_server() {
                         LOG_NOTICE("whisper_lookup '%s' — not found", name.c_str());
                         return;
                     }
-                    // Check target is online
+                    // Check target is online; collect data under lock, send outside.
+                    VoiceSocket* target_ws = nullptr;
+                    json  to_target, to_self;
+                    bool  offline = false, bypass = false;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         auto it = g_by_char_id.find(target_id);
                         if (it == g_by_char_id.end() || !it->second || !it->second->authed) {
-                            send_json(ws, json{{"type","whisper_lookup_fail"},{"reason","offline"}});
-                            LOG_NOTICE("whisper_lookup '%s' (id=%d) — offline", name.c_str(), target_id);
-                            return;
-                        }
-                        // Found online — proceed as whisper_request
-                        ClientSession* target = it->second;
-                        clear_existing_whisper(s);
-                        std::string sid = g_whisper.request(s->char_id, target_id);
-                        s->whisper_sid = sid;
-                        if (voice_db_whisper_bypass(s->group_id)) {
-                            g_whisper.accept(sid, target_id);
-                            target->whisper_sid = sid;
-                            send_json(target->ws, json{
-                                {"type","whisper_active"},
-                                {"sid", sid},
-                                {"peer_name", s->char_name}
-                            });
-                            send_json(ws, json{{"type","whisper_active"},{"sid",sid},{"peer_name",target->char_name}});
-                            LOG_NOTICE("whisper_lookup bypass (GM) '%s' → char_id=%d, active", name.c_str(), target_id);
+                            offline = true;
                         } else {
-                            send_json(target->ws, json{
-                                {"type","whisper_incoming"},
-                                {"sid", sid},
-                                {"from_char_id", s->char_id},
-                                {"from_name",    s->char_name}
-                            });
-                            send_json(ws, json{{"type","whisper_calling"},{"sid",sid},{"target_name",target->char_name}});
-                            LOG_NOTICE("whisper_lookup '%s' → char_id=%d, calling", name.c_str(), target_id);
+                            ClientSession* target = it->second;
+                            clear_existing_whisper(s);
+                            std::string sid = g_whisper.request(s->char_id, target_id);
+                            s->whisper_sid = sid;
+                            bypass    = voice_db_whisper_bypass(s->group_id);
+                            target_ws = target->ws;
+                            if (bypass) {
+                                g_whisper.accept(sid, target_id);
+                                target->whisper_sid = sid;
+                                to_target = json{{"type","whisper_active"},{"sid",sid},{"peer_name",s->char_name}};
+                                to_self   = json{{"type","whisper_active"},{"sid",sid},{"peer_name",target->char_name}};
+                            } else {
+                                to_target = json{{"type","whisper_incoming"},{"sid",sid},{"from_char_id",s->char_id},{"from_name",s->char_name}};
+                                to_self   = json{{"type","whisper_calling"},{"sid",sid},{"target_name",target->char_name}};
+                            }
                         }
                     }
+                    if (offline) {
+                        send_json(ws, json{{"type","whisper_lookup_fail"},{"reason","offline"}});
+                        LOG_NOTICE("whisper_lookup '%s' (id=%d) — offline", name.c_str(), target_id);
+                        return;
+                    }
+                    send_json(target_ws, to_target);
+                    send_json(ws,        to_self);
+                    if (bypass)
+                        LOG_NOTICE("whisper_lookup bypass (GM) '%s' → char_id=%d, active", name.c_str(), target_id);
+                    else
+                        LOG_NOTICE("whisper_lookup '%s' → char_id=%d, calling", name.c_str(), target_id);
                     return;
                 }
 
@@ -1998,58 +2001,69 @@ void run_server() {
                         LOG_WARNING("whisper_request rate-limited char_id=%d target=%d", s->char_id, target_id);
                         return;
                     }
-                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                    auto it = g_by_char_id.find(target_id);
-                    if (it == g_by_char_id.end() || !it->second || !it->second->authed) {
+                    // Collect data under lock, send outside — avoids holding
+                    // g_session_mtx while a TCP write blocks on a slow client.
+                    VoiceSocket* target_ws = nullptr;
+                    json  to_target, to_self;
+                    bool  offline = false;
+                    bool  bypass  = false;
+                    std::string log_src, log_dst, log_sid;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        auto it = g_by_char_id.find(target_id);
+                        if (it == g_by_char_id.end() || !it->second || !it->second->authed) {
+                            offline = true;
+                        } else {
+                            ClientSession* target = it->second;
+                            clear_existing_whisper(s);
+                            std::string sid = g_whisper.request(s->char_id, target_id);
+                            s->whisper_sid = sid;
+                            bypass     = voice_db_whisper_bypass(s->group_id);
+                            target_ws  = target->ws;
+                            log_src    = s->char_name;
+                            log_dst    = target->char_name;
+                            log_sid    = sid;
+                            if (bypass) {
+                                g_whisper.accept(sid, target_id);
+                                target->whisper_sid = sid;
+                                to_target = json{{"type","whisper_active"},{"sid",sid},{"peer_name",s->char_name}};
+                                to_self   = json{{"type","whisper_active"},{"sid",sid},{"peer_name",target->char_name}};
+                            } else {
+                                to_target = json{{"type","whisper_incoming"},{"sid",sid},{"from_char_id",s->char_id},{"from_name",s->char_name}};
+                                to_self   = json{{"type","whisper_calling"},{"sid",sid},{"target_name",target->char_name}};
+                            }
+                        }
+                    }
+                    if (offline) {
                         send_json(ws, json{{"type","whisper_unavailable"},{"reason","offline"}});
                         return;
                     }
-                    ClientSession* target = it->second;
-                    // Cancel any previous pending session from this sender
-                    clear_existing_whisper(s);
-                    std::string sid = g_whisper.request(s->char_id, target_id);
-                    s->whisper_sid = sid;
-
-                    if (voice_db_whisper_bypass(s->group_id)) {
-                        // GM bypass — auto-accept without notifying target to confirm
-                        g_whisper.accept(sid, target_id);
-                        target->whisper_sid = sid;
-                        send_json(target->ws, json{
-                            {"type","whisper_active"},
-                            {"sid", sid},
-                            {"peer_name", s->char_name}
-                        });
-                        send_json(ws, json{{"type","whisper_active"},{"sid",sid},{"peer_name",target->char_name}});
-                        LOG_NOTICE("whisper_bypass (GM) %s→%s sid=%s", s->char_name.c_str(), target->char_name.c_str(), sid.c_str());
-                    } else {
-                        send_json(target->ws, json{
-                            {"type","whisper_incoming"},
-                            {"sid", sid},
-                            {"from_char_id", s->char_id},
-                            {"from_name",    s->char_name}
-                        });
-                        send_json(ws, json{{"type","whisper_calling"},{"sid",sid},{"target_name",target->char_name}});
-                        LOG_NOTICE("whisper_request %s→%s sid=%s", s->char_name.c_str(), target->char_name.c_str(), sid.c_str());
-                    }
+                    send_json(target_ws, to_target);
+                    send_json(ws,        to_self);
+                    if (bypass)
+                        LOG_NOTICE("whisper_bypass (GM) %s→%s sid=%s", log_src.c_str(), log_dst.c_str(), log_sid.c_str());
+                    else
+                        LOG_NOTICE("whisper_request %s→%s sid=%s", log_src.c_str(), log_dst.c_str(), log_sid.c_str());
                     return;
                 }
 
                 if (type == "whisper_accept") {
                     std::string sid = j.value("sid", "");
                     if (!g_whisper.accept(sid, s->char_id)) return;
-                    // get_peer uses its own mutex — no g_session_mtx needed yet.
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
-                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                    // Write whisper_sid inside the exclusive lock so the UDP audio-
-                    // routing path (shared_lock) never sees a torn std::string.
-                    s->whisper_sid = sid;
-                    auto it = g_by_char_id.find(peer_id);
-                    if (it != g_by_char_id.end() && it->second) {
-                        send_json(it->second->ws, json{
-                            {"type","whisper_active"},{"sid",sid},{"peer_name",s->char_name}
-                        });
+                    VoiceSocket* peer_ws   = nullptr;
+                    std::string  peer_name;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        s->whisper_sid = sid;
+                        auto it = g_by_char_id.find(peer_id);
+                        if (it != g_by_char_id.end() && it->second) {
+                            peer_ws   = it->second->ws;
+                            peer_name = it->second->char_name;
+                        }
                     }
-                    send_json(ws, json{{"type","whisper_active"},{"sid",sid},{"peer_name", it != g_by_char_id.end() && it->second ? it->second->char_name : ""}});
+                    if (peer_ws) send_json(peer_ws, json{{"type","whisper_active"},{"sid",sid},{"peer_name",s->char_name}});
+                    send_json(ws, json{{"type","whisper_active"},{"sid",sid},{"peer_name",peer_name}});
                     LOG_NOTICE("whisper_accept sid=%s char_id=%d", sid.c_str(), s->char_id);
                     return;
                 }
@@ -2058,14 +2072,17 @@ void run_server() {
                     std::string sid = j.value("sid", "");
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
                     if (!g_whisper.reject(sid, s->char_id)) return;
-                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                    // Clear inside the lock — UDP routing reads whisper_sid under shared_lock.
-                    s->whisper_sid.clear();
-                    auto it = g_by_char_id.find(peer_id);
-                    if (it != g_by_char_id.end() && it->second) {
-                        send_json(it->second->ws, json{{"type","whisper_rejected"},{"sid",sid}});
-                        it->second->whisper_sid.clear();
+                    VoiceSocket* peer_ws = nullptr;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        s->whisper_sid.clear();
+                        auto it = g_by_char_id.find(peer_id);
+                        if (it != g_by_char_id.end() && it->second) {
+                            peer_ws = it->second->ws;
+                            it->second->whisper_sid.clear();
+                        }
                     }
+                    if (peer_ws) send_json(peer_ws, json{{"type","whisper_rejected"},{"sid",sid}});
                     LOG_NOTICE("whisper_reject sid=%s", sid.c_str());
                     return;
                 }
@@ -2074,14 +2091,17 @@ void run_server() {
                     std::string sid = j.value("sid", "");
                     int peer_id = g_whisper.get_peer(sid, s->char_id);
                     if (!g_whisper.end(sid, s->char_id)) return;
-                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                    // Clear inside the lock — UDP routing reads whisper_sid under shared_lock.
-                    s->whisper_sid.clear();
-                    auto it = g_by_char_id.find(peer_id);
-                    if (it != g_by_char_id.end() && it->second) {
-                        send_json(it->second->ws, json{{"type","whisper_ended"},{"sid",sid}});
-                        it->second->whisper_sid.clear();
+                    VoiceSocket* peer_ws = nullptr;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        s->whisper_sid.clear();
+                        auto it = g_by_char_id.find(peer_id);
+                        if (it != g_by_char_id.end() && it->second) {
+                            peer_ws = it->second->ws;
+                            it->second->whisper_sid.clear();
+                        }
                     }
+                    if (peer_ws) send_json(peer_ws, json{{"type","whisper_ended"},{"sid",sid}});
                     LOG_NOTICE("whisper_end sid=%s", sid.c_str());
                     return;
                 }
