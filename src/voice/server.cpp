@@ -385,6 +385,7 @@ struct ClientSession {
     int         client_war_recommend  = -2;
     std::string whisper_sid;    // active or pending whisper session ID
     uint32_t    last_nearby_ms        = 0;  // last time nearby_players was broadcast to this client
+    uint64_t    last_nearby_hash      = 0;  // last nearby_players payload signature
 
     // Token bucket rate limiter for audio packets
     // Normal speech = 50 packets/sec (20ms frames). Allow burst up to 100.
@@ -495,16 +496,58 @@ static std::unordered_map<std::string, std::unordered_set<ClientSession*>> g_by_
 static std::unordered_map<int,         std::unordered_set<ClientSession*>> g_by_party;
 static std::unordered_map<int,         std::unordered_set<ClientSession*>> g_by_guild;
 static std::unordered_map<int,         std::unordered_set<ClientSession*>> g_by_room;
+static std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_set<ClientSession*>>> g_by_spatial;
+
+static constexpr int SPATIAL_CELL_SIZE = 16;
+
+static int spatial_cell(int v) {
+    return v >= 0 ? (v / SPATIAL_CELL_SIZE) : ((v - SPATIAL_CELL_SIZE + 1) / SPATIAL_CELL_SIZE);
+}
+
+static int64_t spatial_key(int cx, int cy) {
+    return (static_cast<int64_t>(cx) << 32) ^ static_cast<uint32_t>(cy);
+}
+
+static int64_t spatial_key_for_pos(int x, int y) {
+    return spatial_key(spatial_cell(x), spatial_cell(y));
+}
+
+static bool spatial_indexable(const ClientSession* s) {
+    return s && !s->map.empty() &&
+        s->last_position_ms != 0 &&
+        (tick_ms() - s->last_position_ms) <= POSITION_STALE_MS;
+}
+
+static void spatial_remove(ClientSession* s) {
+    if (!s || s->map.empty() || s->last_position_ms == 0) return;
+    auto map_it = g_by_spatial.find(s->map);
+    if (map_it == g_by_spatial.end()) return;
+    const int64_t key = spatial_key_for_pos(s->x, s->y);
+    auto cell_it = map_it->second.find(key);
+    if (cell_it == map_it->second.end()) return;
+    cell_it->second.erase(s);
+    if (cell_it->second.empty())
+        map_it->second.erase(cell_it);
+    if (map_it->second.empty())
+        g_by_spatial.erase(map_it);
+}
+
+static void spatial_insert(ClientSession* s) {
+    if (!spatial_indexable(s)) return;
+    g_by_spatial[s->map][spatial_key_for_pos(s->x, s->y)].insert(s);
+}
 
 // Call under g_session_mtx (exclusive)
 static void idx_insert(ClientSession* s) {
     if (!s->map.empty())       g_by_map[s->map].insert(s);
+    spatial_insert(s);
     if (s->party_id > 0)       g_by_party[s->party_id].insert(s);
     if (s->guild_id > 0)       g_by_guild[s->guild_id].insert(s);
     if (s->chat_room_id > 0)   g_by_room[s->chat_room_id].insert(s);
 }
 
 static void idx_remove(ClientSession* s) {
+    spatial_remove(s);
     if (!s->map.empty())     { auto it = g_by_map.find(s->map);           if (it != g_by_map.end())    it->second.erase(s); }
     if (s->party_id > 0)     { auto it = g_by_party.find(s->party_id);    if (it != g_by_party.end())  it->second.erase(s); }
     if (s->guild_id > 0)     { auto it = g_by_guild.find(s->guild_id);    if (it != g_by_guild.end())  it->second.erase(s); }
@@ -513,9 +556,29 @@ static void idx_remove(ClientSession* s) {
 
 static void idx_set_map(ClientSession* s, const std::string& v) {
     if (s->map == v) return;
+    spatial_remove(s);
     if (!s->map.empty()) { auto it = g_by_map.find(s->map); if (it != g_by_map.end()) it->second.erase(s); }
     s->map = v;
+    s->last_nearby_hash = 0;
     if (!v.empty()) g_by_map[v].insert(s);
+    spatial_insert(s);
+}
+
+static void idx_set_position(ClientSession* s, const std::string& map, int x, int y, uint32_t now) {
+    spatial_remove(s);
+    if (s->map != map) {
+        if (!s->map.empty()) {
+            auto old_it = g_by_map.find(s->map);
+            if (old_it != g_by_map.end()) old_it->second.erase(s);
+        }
+        s->map = map;
+        s->last_nearby_hash = 0;
+        if (!s->map.empty()) g_by_map[s->map].insert(s);
+    }
+    s->x = x;
+    s->y = y;
+    s->last_position_ms = now;
+    spatial_insert(s);
 }
 
 static void idx_set_party(ClientSession* s, int v) {
@@ -653,6 +716,25 @@ static float calc_volume(const ClientSession& from, const ClientSession& to) {
     return vol;
 }
 
+template <typename Fn>
+static void for_each_spatial_candidate(const ClientSession& from, Fn&& fn) {
+    auto map_it = g_by_spatial.find(from.map);
+    if (map_it == g_by_spatial.end()) return;
+
+    const int cx = spatial_cell(from.x);
+    const int cy = spatial_cell(from.y);
+    const int radius = static_cast<int>(std::ceil((g_cfg.proximity_max_range + PROXIMITY_EDGE_GUARD_CELLS) /
+                                                  static_cast<float>(SPATIAL_CELL_SIZE))) + 1;
+    for (int dy = -radius; dy <= radius; ++dy) {
+        for (int dx = -radius; dx <= radius; ++dx) {
+            auto cell_it = map_it->second.find(spatial_key(cx + dx, cy + dy));
+            if (cell_it == map_it->second.end()) continue;
+            for (ClientSession* other : cell_it->second)
+                fn(other);
+        }
+    }
+}
+
 static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& from, const ClientSession& to) {
     if (!to.authed) return false;
     if (to.deafened) return false;
@@ -741,15 +823,28 @@ static void send_json_deferred(ClientSession* target, json msg) {
 static constexpr uint32_t NEARBY_BROADCAST_INTERVAL_MS = 1000;
 static void send_nearby_players_deferred(ClientSession* s) {
     if (!s || !s->authed || s->map.empty()) return;
-    json players = json::array();
-    auto map_it = g_by_map.find(s->map);
-    if (map_it != g_by_map.end()) {
-        for (ClientSession* other : map_it->second) {
-            if (!other || other->char_id == s->char_id || !other->authed) continue;
-            if (calc_volume(*s, *other) > 0.0f)
-                players.push_back({{"id", other->char_id}, {"name", other->char_name}});
-        }
+
+    std::vector<std::pair<int, std::string>> nearby;
+    for_each_spatial_candidate(*s, [&](ClientSession* other) {
+        if (!other || other->char_id == s->char_id || !other->authed) return;
+        if (calc_volume(*s, *other) > 0.0f)
+            nearby.push_back({other->char_id, other->char_name});
+    });
+    std::sort(nearby.begin(), nearby.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (const auto& [id, name] : nearby) {
+        hash ^= static_cast<uint32_t>(id);
+        hash *= UINT64_C(1099511628211);
     }
+    if (hash == s->last_nearby_hash)
+        return;
+    s->last_nearby_hash = hash;
+
+    json players = json::array();
+    for (const auto& [id, name] : nearby)
+        players.push_back({{"id", id}, {"name", name}});
     send_json_deferred(s, json{{"type", "nearby_players"}, {"players", players}});
 }
 
@@ -1340,14 +1435,12 @@ static void udp_position_loop() {
 
         ClientSession* s = it->second;
         LOG_DEBUG("UDP pos char_id=%d %s(%d,%d) lv=%d job=%d grp=%d war=%d", char_id, new_map.c_str(), new_x, new_y, new_level, new_job, new_gid, new_war_map ? 1 : 0);
-        idx_set_map(s, new_map);
-        s->x        = new_x;
-        s->y        = new_y;
+        const uint32_t now_pos = tick_ms();
+        idx_set_position(s, new_map, new_x, new_y, now_pos);
         s->level    = new_level;
         s->job      = new_job;
         s->group_id = new_gid;
         s->war_map  = new_war_map;
-        s->last_position_ms = tick_ms();
 
         // Push own position back to the DLL so it can do stereo panning
         // without needing to read memory offsets for CHAR_X / CHAR_Y.
@@ -2237,8 +2330,12 @@ void run_server() {
 
                     switch (channel) {
                         case 0: { // Normal proximity — only same-map players
-                            auto it = g_by_map.find(s->map);
-                            if (it != g_by_map.end()) collect(it->second);
+                            for_each_spatial_candidate(*s, [&](ClientSession* to) {
+                                if (!to) return;
+                                if (!should_forward(channel, gid, *s, *to)) return;
+                                float vol = volume_for(channel, *s, *to);
+                                if (vol > 0.0f) targets.push_back({to, vol});
+                            });
                             break;
                         }
                         case 1: { // Party
