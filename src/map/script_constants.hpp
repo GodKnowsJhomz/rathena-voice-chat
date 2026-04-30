@@ -10226,6 +10226,7 @@
 	export_constant(HAT_EF_C_JAOW_PIRUN);
 	export_constant(FOOTPRINT_EF_FLOWER_GARDEN);
 	export_constant(HAT_EF_C_ANGEL_GIFT);
+	export_constant(HAT_EF_MIC);
 
 	/* pet catch */
 	export_constant(PET_CATCH_UNIVERSAL_NO_BOSS);

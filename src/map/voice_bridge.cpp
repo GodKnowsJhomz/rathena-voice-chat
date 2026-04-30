@@ -1,4 +1,7 @@
 #include "voice_bridge.hpp"
+#include "clif.hpp"
+#include "script.hpp"
+#include "unit.hpp"
 #include "../common/timer.hpp"
 
 #ifdef _WIN32
@@ -14,6 +17,7 @@
 #  include <sys/socket.h>
 #  include <netinet/in.h>
 #  include <arpa/inet.h>
+#  include <fcntl.h>
 #  include <unistd.h>
    using socket_t = int;
    static constexpr socket_t INVALID_SOCK = -1;
@@ -26,6 +30,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <unordered_map>
@@ -36,6 +41,7 @@ namespace {
 	sockaddr_in g_voice_addr{};
 	bool        g_ready      = false;
 	std::string g_bridge_secret;
+	int         g_speaking_hat_effect = HAT_EF_MIC;
 
 	std::string trim_copy(std::string s) {
 		size_t a = s.find_first_not_of(" \t\r\n");
@@ -86,6 +92,11 @@ namespace {
 					port = std::atoi(val.c_str());
 			} else if (key == "voice_bridge_secret") {
 				g_bridge_secret = val;
+			} else if (key == "voice_speaking_hat_effect") {
+				if (val.empty() || val == "HAT_EF_MIC" || val == "HAT_EF_C_SPOT_MIKE")
+					g_speaking_hat_effect = HAT_EF_MIC;
+				else
+					g_speaking_hat_effect = std::atoi(val.c_str());
 			}
 		}
 	}
@@ -133,6 +144,110 @@ namespace {
 			sizeof(g_voice_addr)
 		);
 		return rc == static_cast<int>(payload.size());
+	}
+
+	std::string json_string_field(const std::string& s, const char* key) {
+		const std::string needle = std::string("\"") + key + "\":\"";
+		size_t pos = s.find(needle);
+		if (pos == std::string::npos)
+			return {};
+		pos += needle.size();
+		size_t end = s.find('"', pos);
+		return (end == std::string::npos) ? std::string{} : s.substr(pos, end - pos);
+	}
+
+	int json_int_field(const std::string& s, const char* key, int def = 0) {
+		const std::string needle = std::string("\"") + key + "\":";
+		size_t pos = s.find(needle);
+		if (pos == std::string::npos)
+			return def;
+		pos += needle.size();
+		return std::atoi(s.c_str() + pos);
+	}
+
+	bool json_bool_field(const std::string& s, const char* key, bool def = false) {
+		const std::string needle = std::string("\"") + key + "\":";
+		size_t pos = s.find(needle);
+		if (pos == std::string::npos)
+			return def;
+		pos += needle.size();
+		if (s.compare(pos, 4, "true") == 0)
+			return true;
+		if (s.compare(pos, 5, "false") == 0)
+			return false;
+		return def;
+	}
+
+	bool voice_reply_allowed(const sockaddr_in& from) {
+		return from.sin_addr.s_addr == g_voice_addr.sin_addr.s_addr &&
+			from.sin_port == g_voice_addr.sin_port;
+	}
+
+	void voice_set_speaking_hat(int char_id, bool enable) {
+		if (char_id <= 0 || g_speaking_hat_effect <= HAT_EF_MIN || g_speaking_hat_effect >= HAT_EF_MAX)
+			return;
+
+		map_session_data* sd = map_charid2sd(char_id);
+		if (sd == nullptr)
+			return;
+
+		unit_data* ud = unit_bl2ud(sd);
+		if (ud == nullptr)
+			return;
+
+		const int16 effect = static_cast<int16>(g_speaking_hat_effect);
+		auto it = std::find(ud->hatEffects.begin(), ud->hatEffects.end(), effect);
+		if (enable) {
+			if (it != ud->hatEffects.end())
+				return;
+			ud->hatEffects.push_back(effect);
+		} else {
+			if (it == ud->hatEffects.end())
+				return;
+			ud->hatEffects.erase(it);
+		}
+
+		if (!sd->state.connect_new)
+			clif_hat_effect_single_target(*sd, static_cast<uint16>(effect), enable, enable ? AREA_WOS : AREA);
+	}
+
+	int voice_bridge_clear_speaking_hat(map_session_data* sd, va_list) {
+		if (sd)
+			voice_set_speaking_hat(sd->status.char_id, false);
+		return 0;
+	}
+
+	void voice_bridge_poll_replies() {
+		if (!g_ready || g_sock == INVALID_SOCK)
+			return;
+
+		char buf[1024];
+		for (int drained = 0; drained < 64; ++drained) {
+			sockaddr_in from{};
+#ifdef _WIN32
+			int from_len = sizeof(from);
+#else
+			socklen_t from_len = sizeof(from);
+#endif
+			int n = recvfrom(g_sock, buf, sizeof(buf) - 1, 0,
+				reinterpret_cast<sockaddr*>(&from), &from_len);
+			if (n <= 0)
+				break;
+			if (!voice_reply_allowed(from))
+				continue;
+
+			buf[n] = '\0';
+			const std::string payload(buf, n);
+			if (!g_bridge_secret.empty() && json_string_field(payload, "bridge_secret") != g_bridge_secret)
+				continue;
+			if (json_string_field(payload, "type") != "speaking_hat")
+				continue;
+
+			voice_set_speaking_hat(
+				json_int_field(payload, "char_id"),
+				json_bool_field(payload, "speaking")
+			);
+		}
 	}
 
 	// Last-sent position cache — keyed by char_id.
@@ -200,7 +315,13 @@ static int voice_bridge_ping_player(map_session_data* sd, va_list) {
 }
 
 static TIMER_FUNC(voice_bridge_tick) {
+	voice_bridge_poll_replies();
 	map_foreachpc(voice_bridge_ping_player);
+	return 0;
+}
+
+static TIMER_FUNC(voice_bridge_reply_tick) {
+	voice_bridge_poll_replies();
 	return 0;
 }
 
@@ -216,6 +337,13 @@ void voice_bridge_init() {
 		wsa_cleanup();
 		return;
 	}
+
+#ifdef _WIN32
+	u_long nonblock = 1;
+	ioctlsocket(g_sock, FIONBIO, &nonblock);
+#else
+	fcntl(g_sock, F_SETFL, fcntl(g_sock, F_GETFL, 0) | O_NONBLOCK);
+#endif
 
 	std::string voice_host = "127.0.0.1";
 	int voice_port = 7001;
@@ -236,9 +364,11 @@ void voice_bridge_init() {
 
 	// Send position for all online players every 1 second
 	add_timer_interval(gettick() + 1000, voice_bridge_tick, 0, 0, 1000);
+	add_timer_interval(gettick() + 100, voice_bridge_reply_tick, 0, 0, 100);
 }
 
 void voice_bridge_final() {
+	map_foreachpc(voice_bridge_clear_speaking_hat);
 	if (g_sock != INVALID_SOCK) {
 		close_socket(g_sock);
 		g_sock = INVALID_SOCK;

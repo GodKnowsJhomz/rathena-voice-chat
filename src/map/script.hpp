@@ -2200,6 +2200,8 @@ enum e_hat_effects : int16{
 	FOOTPRINT_EF_FLOWER_GARDEN,
 	HAT_EF_C_ANGEL_GIFT,
 
+	HAT_EF_MIC,
+
 	HAT_EF_MAX
 };
 

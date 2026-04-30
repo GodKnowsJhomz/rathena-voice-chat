@@ -1044,6 +1044,7 @@ void clif_item_damaged( const map_session_data& sd, uint16 position );
 void clif_item_refine_list( map_session_data& sd );
 void clif_hat_effects( const block_list& bl, enum send_target target, const block_list& tbl );
 void clif_hat_effect_single( const block_list& bl, uint16 effectId, bool enable );
+void clif_hat_effect_single_target( const block_list& bl, uint16 effectId, bool enable, enum send_target target );
 
 void clif_item_skill(const map_session_data* sd,uint16 skill_id,uint16 skill_lv);
 

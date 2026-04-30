@@ -56,6 +56,7 @@ struct SrvConfig {
     int         max_targets_group    = 128;
     int         max_targets_room     = 64;
     int         audio_backpressure_kb = 64;
+    int         speaking_hat_timeout_ms = 900;
     bool        war_mode_enabled     = true;
     bool        war_allow_whisper    = true;
 
@@ -157,6 +158,9 @@ static void load_voice_conf(const char* path) {
         }
         else if (key == "voice_audio_backpressure_kb") {
             if (!val.empty()) g_cfg.audio_backpressure_kb = std::stoi(val); return true;
+        }
+        else if (key == "voice_speaking_hat_timeout_ms" || key == "voice_speaking_timeout_ms") {
+            if (!val.empty()) g_cfg.speaking_hat_timeout_ms = std::stoi(val); return true;
         }
         else if (key == "voice_war_mode_enabled") {
             if (!val.empty()) g_cfg.war_mode_enabled = (std::stoi(val) != 0); return true;
@@ -403,6 +407,8 @@ struct ClientSession {
     uint64_t audio_sent_bytes        = 0;
     uint64_t audio_backpressure_drops = 0;
     uint32_t audio_last_pressure_log = 0;
+    std::atomic<bool>     speaking_hat_on{false};
+    std::atomic<uint32_t> last_speaking_audio_ms{0};
 
     bool rate_limit_check() {
         uint32_t now = tick_ms();
@@ -792,8 +798,58 @@ static std::atomic<bool> g_udp_running{false};
 static std::atomic<bool> g_server_stop_requested{false};
 static std::atomic<bool> g_server_shutdown_deferred{false};
 static VoiceTcp::App* g_app = nullptr;
+static std::mutex g_map_bridge_addr_mtx;
+static sockaddr_in g_map_bridge_addr{};
+static bool g_map_bridge_addr_valid = false;
 
 static void stop_udp_receiver();
+
+static std::string json_escape_copy(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+static void send_map_speaking_hat(int char_id, bool speaking) {
+    if (char_id <= 0 || g_udp_sock == INVALID_SOCKET)
+        return;
+
+    sockaddr_in to{};
+    {
+        std::lock_guard<std::mutex> lock(g_map_bridge_addr_mtx);
+        if (!g_map_bridge_addr_valid)
+            return;
+        to = g_map_bridge_addr;
+    }
+
+    std::string payload = std::string("{\"type\":\"speaking_hat\",\"char_id\":") +
+        std::to_string(char_id) + ",\"speaking\":" + (speaking ? "true" : "false");
+    if (!g_cfg.voice_bridge_secret.empty())
+        payload += ",\"bridge_secret\":\"" + json_escape_copy(g_cfg.voice_bridge_secret) + "\"";
+    payload += "}";
+
+    sendto(g_udp_sock, payload.c_str(), static_cast<int>(payload.size()), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+static void set_session_speaking_hat(ClientSession* s, bool speaking) {
+    if (!s || s->char_id <= 0)
+        return;
+
+    bool expected = !speaking;
+    if (s->speaking_hat_on.compare_exchange_strong(expected, speaking))
+        send_map_speaking_hat(s->char_id, speaking);
+}
 
 static std::string udp_addr_to_ip(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {};
@@ -854,6 +910,7 @@ static void udp_position_loop() {
     static constexpr uint32_t MAINTENANCE_INTERVAL_MS = 10000;
     static constexpr uint32_t PENDING_POS_TTL_MS      = 30000;
     uint32_t last_maintenance = tick_ms();
+    uint32_t last_speaking_maintenance = last_maintenance;
 
     while (g_udp_running) {
         fd_set readfds;
@@ -878,6 +935,26 @@ static void udp_position_loop() {
 
         // ── Periodic maintenance ──────────────────────────────────────────────
         uint32_t now_maint = tick_ms();
+        if (now_maint - last_speaking_maintenance >= 250) {
+            last_speaking_maintenance = now_maint;
+            std::vector<int> speaking_hat_off;
+            {
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                const uint32_t speaking_timeout = static_cast<uint32_t>(std::max(100, g_cfg.speaking_hat_timeout_ms));
+                for (auto& kv : g_by_char_id) {
+                    ClientSession* s = kv.second;
+                    if (!s || !s->speaking_hat_on.load()) continue;
+                    uint32_t last_audio = s->last_speaking_audio_ms.load();
+                    if (last_audio == 0 || now_maint - last_audio >= speaking_timeout) {
+                        s->speaking_hat_on.store(false);
+                        speaking_hat_off.push_back(s->char_id);
+                    }
+                }
+            }
+            for (int char_id : speaking_hat_off)
+                send_map_speaking_hat(char_id, false);
+        }
+
         if (now_maint - last_maintenance >= MAINTENANCE_INTERVAL_MS) {
             last_maintenance = now_maint;
 
@@ -999,6 +1076,12 @@ static void udp_position_loop() {
         if (!udp_secret_allowed(j)) {
             LOG_WARNING("UDP control rejected from %s: bad bridge secret", udp_addr_to_ip(from_addr).c_str());
             continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_map_bridge_addr_mtx);
+            g_map_bridge_addr = from_addr;
+            g_map_bridge_addr_valid = true;
         }
 
         std::string type = j.value("type", "");
@@ -2097,6 +2180,9 @@ void run_server() {
                           s->char_id, channel, gid, (unsigned)seq, pcm_bytes,
                           s->map.c_str(), s->x, s->y, has_fresh_position(*s) ? 1 : 0);
 
+                s->last_speaking_audio_ms.store(tick_ms());
+                set_session_speaking_hat(s, true);
+
                 // Build target list using pre-built indexes — O(channel_members)
                 // instead of O(all_sessions).  Much faster at 3000+ players.
                 // Uses shared_lock: concurrent audio routing reads don't block
@@ -2187,6 +2273,7 @@ void run_server() {
             int log_online = 0;
             uint64_t log_session_id = 0;
             std::string log_ip;
+            int speaking_hat_off_char_id = 0;
 
             {
                 std::lock_guard<std::shared_mutex> lock(g_session_mtx);
@@ -2220,7 +2307,12 @@ void run_server() {
                 log_session_id = s->session_id;
                 log_ip = s->ip;
                 log_online = g_player_count;
+                if (s->speaking_hat_on.exchange(false))
+                    speaking_hat_off_char_id = s->char_id;
             }
+
+            if (speaking_hat_off_char_id > 0)
+                send_map_speaking_hat(speaking_hat_off_char_id, false);
 
             const char* reason = (code == 1000) ? "normal"
                                : (code == 1001) ? "going away"
