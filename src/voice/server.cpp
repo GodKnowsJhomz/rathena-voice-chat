@@ -862,6 +862,10 @@ static bool udp_source_allowed(const sockaddr_in& from_addr) {
     return ip == g_cfg.voice_api_ip;
 }
 
+static bool is_loopback_ip(const std::string& ip) {
+    return ip == "127.0.0.1" || ip == "localhost" || ip.rfind("127.", 0) == 0;
+}
+
 static bool udp_secret_allowed(const json& j) {
     if (g_cfg.voice_bridge_secret.empty())
         return true;
@@ -1614,6 +1618,9 @@ void run_server() {
     LOG_STATUS("Bridge API  %s:%d  secret=%s",
                g_cfg.voice_api_ip.c_str(), g_cfg.voice_api_port,
                g_cfg.voice_bridge_secret.empty() ? "disabled" : "enabled");
+    if (g_cfg.voice_bridge_secret.empty() && !is_loopback_ip(g_cfg.voice_api_ip)) {
+        LOG_WARNING("voice_bridge_secret is empty while Bridge API is not loopback-only");
+    }
     LOG_INFO("Proximity   full=%.0f cell  max=%.0f cell  update=%dms  guard=%.2f",
              g_cfg.proximity_full_range, g_cfg.proximity_max_range,
              g_cfg.proximity_update_ms, PROXIMITY_EDGE_GUARD_CELLS);
@@ -1786,6 +1793,7 @@ void run_server() {
                     // from a prior reconnect (position already on session).
                     std::string init_map;
                     int init_x = 0, init_y = 0;
+                    int online_snapshot = 0;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
 
@@ -1880,6 +1888,7 @@ void run_server() {
 
                         // If we replaced an existing authed session, count stays the same.
                         if (!replacing) g_player_count++;
+                        online_snapshot = g_player_count;
                     }
                     for (const auto& [target, reason] : sessions_to_close) {
                         if (target && target->ws) {
@@ -1891,7 +1900,7 @@ void run_server() {
                     LOG_NOTICE("(char_id=%d aid=%d sid=%llu name=%s ip=%s) party=%d guild=%d  [online: %d]",
                                s->char_id, s->account_id, static_cast<unsigned long long>(s->session_id),
                                s->char_name.c_str(), s->ip.c_str(),
-                               s->party_id, s->guild_id, g_player_count);
+                               s->party_id, s->guild_id, online_snapshot);
                     send_json(ws, json{{"type", "auth_ok"}});
                     send_json(ws, make_war_state_json(*s));
                     // Push initial position so the DLL knows where the player is
