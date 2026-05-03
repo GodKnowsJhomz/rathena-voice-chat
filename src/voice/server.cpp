@@ -1115,19 +1115,29 @@ static void udp_position_loop() {
                 std::vector<std::pair<int, uint64_t>> victims = std::move(advisory_timeout_kicks);
                 g_voice_loop.load()->defer([victims]() {
                     for (const auto& [char_id, session_id] : victims) {
-                        ClientSession* s = nullptr;
+                        // NOTE: .close callback runs on the client_loop thread, not the
+                        // server loop. ws->end() only closes the socket + joins send_thread;
+                        // it does NOT call close_cb synchronously. So it is safe (and
+                        // necessary) to hold g_session_mtx across the send/end calls to
+                        // prevent a concurrent client_loop thread from running delete_cb
+                        // (which frees the session) between the lookup and the ws->send().
+                        VoiceSocket* ws = nullptr;
+                        int log_char_id = 0;
+                        std::string log_ip;
                         {
-                            std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                            std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                             auto it = g_by_char_id.find(char_id);
                             if (it == g_by_char_id.end() || !it->second || !it->second->ws) continue;
                             if (it->second->session_id != session_id) continue;
-                            s = it->second;
+                            ws          = it->second->ws;
+                            log_char_id = it->second->char_id;
+                            log_ip      = it->second->ip;
                         }
                         LOG_WARNING("auth timeout — advisory never arrived  char_id=%d ip=%s (kick)",
-                                    s->char_id, s->ip.c_str());
-                        s->ws->send(json{{"type","error"},{"message","no active map session"}}.dump(),
-                                    VoiceTcp::OpCode::TEXT);
-                        s->ws->end(1008, "no advisory");
+                                    log_char_id, log_ip.c_str());
+                        ws->send(json{{"type","error"},{"message","no active map session"}}.dump(),
+                                 VoiceTcp::OpCode::TEXT);
+                        ws->end(1008, "no advisory");
                     }
                 });
             }
@@ -1287,19 +1297,19 @@ static void udp_position_loop() {
                     int target_char_id = spoof_char_id;
                     uint64_t target_session_id = spoof_session_id;
                     g_voice_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
-                        ClientSession* target = nullptr;
+                        VoiceSocket* ws = nullptr;
                         {
-                            std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                            std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                             auto it = g_by_char_id.find(target_char_id);
                             if (it == g_by_char_id.end() || !it->second || !it->second->ws) return;
                             if (it->second->session_id != target_session_id) return;
-                            target = it->second;
+                            ws = it->second->ws;
                         }
                         LOG_WARNING("auth SPOOF (late advisory) — char_id=%d claimed aid=%d but advisory aid=%d",
                                     cid_cap, clm_cap, adv_cap);
-                        target->ws->send(json{{"type","error"},{"message","credentials mismatch"}}.dump(),
-                                         VoiceTcp::OpCode::TEXT);
-                        target->ws->end(1008, "spoof");
+                        ws->send(json{{"type","error"},{"message","credentials mismatch"}}.dump(),
+                                 VoiceTcp::OpCode::TEXT);
+                        ws->end(1008, "spoof");
                     });
                 }
             }
@@ -1332,31 +1342,34 @@ static void udp_position_loop() {
 
             if (g_voice_loop.load()) {
                 g_voice_loop.load()->defer([cid]() {
-                    // Step 1: lookup + set `kicking` flag under the session lock.
-                    // We deliberately keep `authed` untouched here — the close
-                    // handler below reads it to decrement g_player_count, and if
-                    // we flipped it to false the online counter would leak.
-                    ClientSession* target = nullptr;
-                    bool spoof_mismatch = false;
+                    // Look up the session, set kicking=true, and capture the ws pointer
+                    // — all under the lock. We then call ws->send/end while still holding
+                    // the lock to prevent a concurrent client_loop thread from running
+                    // delete_cb (which frees the session object) between the lookup and
+                    // our ws->send() call.
+                    //
+                    // NOTE: the .close callback runs on the client_loop thread, NOT on
+                    // the server loop thread. ws->end() only closes the socket + joins
+                    // send_thread; it does NOT call close_cb synchronously. There is
+                    // therefore no deadlock risk from holding g_session_mtx here.
+                    //
+                    // We deliberately leave `authed` untouched — the close handler reads
+                    // it to decrement g_player_count; flipping it here would leak the
+                    // online counter.
+                    VoiceSocket* ws = nullptr;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         auto it = g_by_char_id.find(cid);
                         if (it == g_by_char_id.end() || !it->second) return;  // already gone
                         if (it->second->kicking || !it->second->ws) return;    // already kicked
                         if (!it->second->authed) return;                       // never fully authed
-                        target = it->second;
-                        target->kicking = true;   // second auth_revoke will see this and bail
+                        it->second->kicking = true;   // second auth_revoke will see this and bail
+                        ws = it->second->ws;
                     }
-                    // Step 2: close the connection OUTSIDE the lock. ws->end() triggers
-                    // our close handler synchronously on this same server loop
-                    // thread, and that handler re-acquires g_session_mtx — holding
-                    // it here would deadlock. Since we're on the server thread and
-                    // the close handler only runs when we unwind, `target` stays
-                    // valid across these two calls.
                     LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing connection", cid);
-                    target->ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
-                                     VoiceTcp::OpCode::TEXT);
-                    target->ws->end(1000, "map logoff");
+                    ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
+                             VoiceTcp::OpCode::TEXT);
+                    ws->end(1000, "map logoff");
                 });
             }
             continue;
