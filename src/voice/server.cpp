@@ -458,6 +458,12 @@ struct PendingPos {
     uint32_t ms = 0;
 };
 
+struct SessionKick {
+    int char_id = 0;
+    uint64_t session_id = 0;
+    std::string reason;
+};
+
 // ── Session lock — split from the old single g_mtx ────────────────────────────
 // Audio routing (hot path) acquires a shared_lock (reader) so multiple routing
 // operations don't block each other, and the UDP position writer only briefly
@@ -820,6 +826,31 @@ static void send_json_deferred(ClientSession* target, json msg) {
     });
 }
 
+static void kick_session_deferred(int target_char_id,
+                                  uint64_t target_session_id,
+                                  json msg,
+                                  std::string reason,
+                                  int code = 1000) {
+    if (!g_voice_loop.load() || target_char_id <= 0 || target_session_id == 0)
+        return;
+
+    std::string payload = msg.dump();
+    g_voice_loop.load()->defer([target_char_id, target_session_id,
+                                payload = std::move(payload),
+                                reason = std::move(reason), code]() {
+        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+        auto it = g_by_char_id.find(target_char_id);
+        if (it == g_by_char_id.end() || !it->second || !it->second->ws)
+            return;
+        ClientSession* current = it->second;
+        if (current->session_id != target_session_id)
+            return;
+        current->kicking = true;
+        current->ws->send(payload, VoiceTcp::OpCode::TEXT);
+        current->ws->end(code, reason);
+    });
+}
+
 static constexpr uint32_t NEARBY_BROADCAST_INTERVAL_MS = 1000;
 static void send_nearby_players_deferred(ClientSession* s) {
     if (!s || !s->authed || s->map.empty()) return;
@@ -1115,13 +1146,8 @@ static void udp_position_loop() {
                 std::vector<std::pair<int, uint64_t>> victims = std::move(advisory_timeout_kicks);
                 g_voice_loop.load()->defer([victims]() {
                     for (const auto& [char_id, session_id] : victims) {
-                        // NOTE: .close callback runs on the client_loop thread, not the
-                        // server loop. ws->end() only closes the socket + joins send_thread;
-                        // it does NOT call close_cb synchronously. So it is safe (and
-                        // necessary) to hold g_session_mtx across the send/end calls to
-                        // prevent a concurrent client_loop thread from running delete_cb
-                        // (which frees the session) between the lookup and the ws->send().
-                        VoiceSocket* ws = nullptr;
+                        // Keep lookup + send/end under the session lock so close_cb
+                        // cannot delete the session between lookup and socket close.
                         int log_char_id = 0;
                         std::string log_ip;
                         {
@@ -1129,15 +1155,15 @@ static void udp_position_loop() {
                             auto it = g_by_char_id.find(char_id);
                             if (it == g_by_char_id.end() || !it->second || !it->second->ws) continue;
                             if (it->second->session_id != session_id) continue;
-                            ws          = it->second->ws;
                             log_char_id = it->second->char_id;
                             log_ip      = it->second->ip;
+                            it->second->kicking = true;
+                            it->second->ws->send(json{{"type","error"},{"message","no active map session"}}.dump(),
+                                                 VoiceTcp::OpCode::TEXT);
+                            it->second->ws->end(1008, "no advisory");
                         }
                         LOG_WARNING("auth timeout — advisory never arrived  char_id=%d ip=%s (kick)",
                                     log_char_id, log_ip.c_str());
-                        ws->send(json{{"type","error"},{"message","no active map session"}}.dump(),
-                                 VoiceTcp::OpCode::TEXT);
-                        ws->end(1008, "no advisory");
                     }
                 });
             }
@@ -1297,19 +1323,18 @@ static void udp_position_loop() {
                     int target_char_id = spoof_char_id;
                     uint64_t target_session_id = spoof_session_id;
                     g_voice_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
-                        VoiceSocket* ws = nullptr;
                         {
                             std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                             auto it = g_by_char_id.find(target_char_id);
                             if (it == g_by_char_id.end() || !it->second || !it->second->ws) return;
                             if (it->second->session_id != target_session_id) return;
-                            ws = it->second->ws;
+                            it->second->kicking = true;
+                            it->second->ws->send(json{{"type","error"},{"message","credentials mismatch"}}.dump(),
+                                                 VoiceTcp::OpCode::TEXT);
+                            it->second->ws->end(1008, "spoof");
                         }
                         LOG_WARNING("auth SPOOF (late advisory) — char_id=%d claimed aid=%d but advisory aid=%d",
                                     cid_cap, clm_cap, adv_cap);
-                        ws->send(json{{"type","error"},{"message","credentials mismatch"}}.dump(),
-                                 VoiceTcp::OpCode::TEXT);
-                        ws->end(1008, "spoof");
                     });
                 }
             }
@@ -1342,7 +1367,7 @@ static void udp_position_loop() {
 
             if (g_voice_loop.load()) {
                 g_voice_loop.load()->defer([cid]() {
-                    // Look up the session, set kicking=true, and capture the ws pointer
+                    // Look up the session, set kicking=true, and close it
                     // — all under the lock. We then call ws->send/end while still holding
                     // the lock to prevent a concurrent client_loop thread from running
                     // delete_cb (which frees the session object) between the lookup and
@@ -1356,7 +1381,6 @@ static void udp_position_loop() {
                     // We deliberately leave `authed` untouched — the close handler reads
                     // it to decrement g_player_count; flipping it here would leak the
                     // online counter.
-                    VoiceSocket* ws = nullptr;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         auto it = g_by_char_id.find(cid);
@@ -1364,12 +1388,11 @@ static void udp_position_loop() {
                         if (it->second->kicking || !it->second->ws) return;    // already kicked
                         if (!it->second->authed) return;                       // never fully authed
                         it->second->kicking = true;   // second auth_revoke will see this and bail
-                        ws = it->second->ws;
+                        it->second->ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
+                                             VoiceTcp::OpCode::TEXT);
+                        it->second->ws->end(1000, "map logoff");
                     }
                     LOG_INFO("auth_revoke char_id=%d — map server reports logoff, closing connection", cid);
-                    ws->send(json{{"type","error"},{"message","map session ended"}}.dump(),
-                             VoiceTcp::OpCode::TEXT);
-                    ws->end(1000, "map logoff");
                 });
             }
             continue;
@@ -1893,7 +1916,7 @@ void run_server() {
                     s->db_refresh_tick = time(nullptr);
 
                     s->authed = true;
-                    std::vector<std::pair<ClientSession*, std::string>> sessions_to_close;
+                    std::vector<SessionKick> sessions_to_close;
                     // Capture initial position to send your_pos after lock is released.
                     // Values may be from pending_pos (position arrived before auth) or
                     // from a prior reconnect (position already on session).
@@ -1943,9 +1966,7 @@ void run_server() {
                                 stale_account_kicks++;   // will decrement g_player_count below
                             }
                             if (other->ws) {
-                                send_json_deferred(other,
-                                    json{{"type","error"},{"message","account logged in as different character"}});
-                                sessions_to_close.push_back({ other, "stale account session" });
+                                sessions_to_close.push_back({ other->char_id, other->session_id, "stale account session" });
                             }
                             idx_remove(other);
                             // Do NOT erase from g_by_char_id here — the kicked
@@ -1971,9 +1992,10 @@ void run_server() {
                             // won't decrement g_player_count (we handle the count here).
                             old->authed = false;
                             if (old->ws) {
-                                send_json_deferred(old,
-                                    json{{"type","error"},{"message","session replaced by new login"}});
-                                sessions_to_close.push_back({ old, "replaced" });
+                                old->kicking = true;
+                                old->ws->send(json{{"type","error"},{"message","session replaced by new login"}}.dump(),
+                                             VoiceTcp::OpCode::TEXT);
+                                old->ws->end(1000, "replaced");
                             }
                             idx_remove(old);
                         }
@@ -1996,10 +2018,10 @@ void run_server() {
                         if (!replacing) g_player_count++;
                         online_snapshot = g_player_count;
                     }
-                    for (const auto& [target, reason] : sessions_to_close) {
-                        if (target && target->ws) {
-                            target->ws->end(1000, reason);
-                        }
+                    for (const auto& kick : sessions_to_close) {
+                        kick_session_deferred(kick.char_id, kick.session_id,
+                            json{{"type","error"},{"message",kick.reason}},
+                            kick.reason);
                     }
 
                     // (g_player_count already updated inside the lock above)
