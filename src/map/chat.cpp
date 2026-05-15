@@ -20,6 +20,7 @@
 #include "npc.hpp" // npc_event_do()
 #include "pc.hpp"
 #include "pc_groups.hpp"
+#include "voice_bridge.hpp"
 
 int32 chat_triggerevent(chat_data *cd); // forward declaration
 
@@ -107,6 +108,7 @@ int32 chat_createpcchat(map_session_data* sd, const char* title, const char* pas
 		unit_stop_attack( sd );
 		clif_createchat( *sd, CREATEROOM_SUCCESS );
 		clif_dispchat(*cd);
+		voice_bridge_send_room_join(sd, cd->id);
 
 		if (status_isdead(*sd))
 			achievement_update_objective(sd, AG_CHATTING_DYING, 1, 1);
@@ -167,6 +169,7 @@ int32 chat_joinchat(map_session_data* sd, int32 chatid, const char* pass)
 	cd->users++;
 
 	pc_setchatid(sd,cd->id);
+	voice_bridge_send_room_join(sd, cd->id);
 
 	// To the person who newly joined the chat
 	clif_joinchatok(*sd, *cd);
@@ -211,6 +214,7 @@ int32 chat_leavechat(map_session_data* sd, bool kicked)
 
 	clif_chat_leave( *cd, *sd, kicked );
 	pc_setchatid(sd, 0);
+	voice_bridge_send_room_leave(sd);
 	cd->users--;
 
 	leavechar = i;

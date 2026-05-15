@@ -759,9 +759,14 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
         if (channel == 4 && !g_cfg.war_allow_whisper) return false;
     }
 
-    // Proximity is blocked at room boundaries (ch0 during war already blocked above).
-    if (channel == 0 && (from.chat_room_id != 0 || to.chat_room_id != 0))
-        return false;
+    // Players inside a chat room are isolated: only Room (3) and Whisper (4) audio
+    // may cross the room boundary.  This is enforced server-side regardless of what
+    // rx_channel the client reports, so a slow/buggy DLL cannot leak Party/Guild/Normal
+    // audio in or out of a room.
+    if (channel != 3 && channel != 4) {
+        if (from.chat_room_id != 0 || to.chat_room_id != 0)
+            return false;
+    }
 
     // ch0/ch1/ch2: sender and receiver must both be tuned to the same channel.
     // Prevents a modified client from broadcasting on a channel it is not tuned to,
