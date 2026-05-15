@@ -1179,17 +1179,19 @@ static void udp_position_loop() {
                 if (!expired.empty()) {
                     g_voice_loop.load()->defer([expired = std::move(expired)]() {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                        const std::string payload =
-                            json{{"type","whisper_ended"},{"reason","timeout"}}.dump();
-                        for (auto& [a, b] : expired) {
-                            for (int cid : {a, b}) {
+                        for (auto& e : expired) {
+                            const std::string payload =
+                                json{{"type","whisper_ended"},{"sid",e.sid},{"reason","timeout"}}.dump();
+                            for (int cid : {e.char_id_a, e.char_id_b}) {
                                 auto it = g_by_char_id.find(cid);
-                                if (it != g_by_char_id.end() && it->second && it->second->ws) {
-                                    it->second->ws->send(payload, VoiceTcp::OpCode::TEXT);
-                                    it->second->whisper_sid.clear();
-                                }
+                                if (it == g_by_char_id.end() || !it->second) continue;
+                                ClientSession* s = it->second;
+                                if (s->whisper_sid != e.sid) continue;
+                                s->whisper_sid.clear();
+                                if (s->ws) s->ws->send(payload, VoiceTcp::OpCode::TEXT);
                             }
-                            LOG_NOTICE("whisper timeout: char_ids %d and %d", a, b);
+                            LOG_NOTICE("whisper timeout: char_ids %d and %d sid=%s",
+                                       e.char_id_a, e.char_id_b, e.sid.c_str());
                         }
                     });
                 }
@@ -1694,7 +1696,7 @@ static void clear_existing_whisper(ClientSession* s) {
         ClientSession* peer = it->second;
         if (peer->whisper_sid == old_sid)
             peer->whisper_sid.clear();
-        if (peer->ws) send_json(peer->ws, json{{"type","whisper_ended"},{"sid",old_sid}});
+        send_json_deferred(peer, json{{"type","whisper_ended"},{"sid",old_sid}});
     }
 }
 

@@ -38,9 +38,11 @@ public:
     // Cleanup expired pending sessions (silent discard)
     void cleanup_expired(int timeout_seconds);
 
-    // Like cleanup_expired but returns {char_id_a, char_id_b} pairs so the
-    // caller can notify both sides before dropping the sessions.
-    std::vector<std::pair<int,int>> collect_expired(int timeout_seconds);
+    // Like cleanup_expired but returns {char_id_a, char_id_b, sid} triples so
+    // the caller can notify both sides and guard against a newer whisper having
+    // replaced the expired one before the deferred lambda runs.
+    struct ExpiredWhisper { int char_id_a; int char_id_b; std::string sid; };
+    std::vector<ExpiredWhisper> collect_expired(int timeout_seconds);
 
 private:
     mutable std::mutex mtx_;

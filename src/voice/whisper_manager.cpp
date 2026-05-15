@@ -93,8 +93,8 @@ void WhisperManager::cleanup_expired(int timeout_sec) {
     }
 }
 
-std::vector<std::pair<int,int>> WhisperManager::collect_expired(int timeout_sec) {
-    std::vector<std::pair<int,int>> result;
+std::vector<WhisperManager::ExpiredWhisper> WhisperManager::collect_expired(int timeout_sec) {
+    std::vector<ExpiredWhisper> result;
     if (timeout_sec <= 0) return result;
     std::lock_guard lock(mtx_);
     auto now = std::chrono::steady_clock::now();
@@ -102,7 +102,7 @@ std::vector<std::pair<int,int>> WhisperManager::collect_expired(int timeout_sec)
         auto age = std::chrono::duration_cast<std::chrono::seconds>(
             now - it->second.created_at).count();
         if (age > timeout_sec) {
-            result.emplace_back(it->second.char_id_a, it->second.char_id_b);
+            result.push_back({it->second.char_id_a, it->second.char_id_b, it->second.session_id});
             it = sessions_.erase(it);
         } else {
             ++it;
