@@ -256,10 +256,9 @@ namespace {
 	// standing players don't lose proximity voice after 2 seconds.
 	static constexpr t_tick KEEPALIVE_MS = 1500;
 
-	// Auth advisory renewal — map server re-asserts each player's identity
-	// every N ms so the voice server's advisory TTL (120 s) never lapses for
-	// legitimately-logged-in characters.
-	static constexpr t_tick AUTH_ADVISORY_RENEW_MS = 30000;
+	// Auth advisory renewal — must be shorter than ADVISORY_GRACE_MS (15 s) so
+	// a reconnecting DLL always finds a fresh advisory within its grace window.
+	static constexpr t_tick AUTH_ADVISORY_RENEW_MS = 5000;
 
 	struct LastPos {
 		short  x        = -1;
