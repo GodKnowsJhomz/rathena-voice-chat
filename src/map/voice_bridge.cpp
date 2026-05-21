@@ -477,6 +477,55 @@ void voice_bridge_send_guild_war_state(bool active) {
 	voice_bridge_send_text(buf);
 }
 
+void voice_bridge_send_admin_mute(int char_id, int duration_sec) {
+	if (!g_ready || char_id <= 0) return;
+	char buf[96];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"admin_mute\",\"char_id\":%d,\"duration\":%d}",
+		char_id, duration_sec);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_admin_unmute(int char_id) {
+	if (!g_ready || char_id <= 0) return;
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "{\"type\":\"admin_unmute\",\"char_id\":%d}", char_id);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_admin_ban(int account_id, int duration_sec) {
+	if (!g_ready || account_id <= 0) return;
+	char buf[96];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"admin_ban\",\"account_id\":%d,\"duration\":%d}",
+		account_id, duration_sec);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_admin_unban(int account_id) {
+	if (!g_ready || account_id <= 0) return;
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "{\"type\":\"admin_unban\",\"account_id\":%d}", account_id);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_admin_ban_by_name(const char* char_name, int duration_sec) {
+	if (!g_ready || !char_name || !char_name[0]) return;
+	char buf[160];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"admin_ban_by_name\",\"char_name\":\"%s\",\"duration\":%d}",
+		char_name, duration_sec);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_admin_unban_by_name(const char* char_name) {
+	if (!g_ready || !char_name || !char_name[0]) return;
+	char buf[128];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"admin_unban_by_name\",\"char_name\":\"%s\"}", char_name);
+	voice_bridge_send_text(buf);
+}
+
 void voice_bridge_send_leave(map_session_data* sd) {
 	if (!g_ready || !sd)
 		return;

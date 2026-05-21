@@ -13,3 +13,9 @@ void voice_bridge_send_room_leave(map_session_data* sd);
 void voice_bridge_send_reload_config();
 void voice_bridge_send_reload_db();
 void voice_bridge_send_guild_war_state(bool active);
+void voice_bridge_send_admin_mute(int char_id, int duration_sec);  // 0 = permanent
+void voice_bridge_send_admin_unmute(int char_id);
+void voice_bridge_send_admin_ban(int account_id, int duration_sec); // 0 = permanent
+void voice_bridge_send_admin_unban(int account_id);
+void voice_bridge_send_admin_ban_by_name(const char* char_name, int duration_sec);
+void voice_bridge_send_admin_unban_by_name(const char* char_name);

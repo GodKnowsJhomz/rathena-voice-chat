@@ -337,6 +337,99 @@ static int db_lookup_char_by_name(const std::string& name) {
     return char_id;
 }
 
+static int db_lookup_account_id_by_name(const std::string& name) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return 0;
+    if (mysql_ping(g_db) != 0) {
+        LOG_WARNING("DB ping failed, reconnecting...");
+        if (!db_connect()) return 0;
+    }
+    char escaped[128] = {};
+    mysql_real_escape_string(g_db, escaped, name.c_str(),
+                             (unsigned long)std::min(name.size(), sizeof(escaped) / 2 - 1));
+    std::string query = "SELECT `account_id` FROM `"
+                      + g_cfg.db_char_table
+                      + "` WHERE `name`='" + escaped + "' LIMIT 1";
+    if (mysql_query(g_db, query.c_str()) != 0) return 0;
+    MYSQL_RES* res = mysql_store_result(g_db);
+    if (!res) return 0;
+    int aid = 0;
+    MYSQL_ROW row = mysql_fetch_row(res);
+    if (row && row[0]) aid = std::atoi(row[0]);
+    mysql_free_result(res);
+    return aid;
+}
+
+// ── Voice ban DB ──────────────────────────────────────────────────────────────
+static void db_ensure_ban_table() {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql =
+        "CREATE TABLE IF NOT EXISTS `voice_bans` ("
+        " `account_id`   INT          NOT NULL,"
+        " `banned_by`    VARCHAR(24)  NOT NULL DEFAULT '',"
+        " `banned_at`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        " `banned_until` DATETIME     NULL DEFAULT NULL,"
+        " PRIMARY KEY (`account_id`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    if (mysql_query(g_db, sql) != 0)
+        LOG_ERROR("voice_bans table create failed: %s", mysql_error(g_db));
+}
+
+static void db_load_bans(std::unordered_map<int, time_t>& out) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql =
+        "SELECT `account_id`, UNIX_TIMESTAMP(`banned_until`) "
+        "FROM `voice_bans` "
+        "WHERE `banned_until` IS NULL OR `banned_until` > NOW()";
+    if (mysql_query(g_db, sql) != 0) {
+        LOG_ERROR("db_load_bans: %s", mysql_error(g_db));
+        return;
+    }
+    MYSQL_RES* res = mysql_store_result(g_db);
+    if (!res) return;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (!row[0]) continue;
+        int aid = std::atoi(row[0]);
+        time_t until = (row[1] && row[1][0]) ? (time_t)std::stoll(row[1]) : 0;
+        out[aid] = until;
+    }
+    mysql_free_result(res);
+    LOG_INFO("voice_bans loaded %zu entry(ies)", out.size());
+}
+
+static void db_insert_ban(int account_id, const std::string& banned_by, time_t until) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    char by_esc[100] = {};
+    mysql_real_escape_string(g_db, by_esc, banned_by.c_str(),
+                             (unsigned long)std::min(banned_by.size(), sizeof(by_esc) / 2 - 1));
+    std::string sql;
+    if (until == 0) {
+        sql = "INSERT INTO `voice_bans` (`account_id`,`banned_by`) VALUES ("
+            + std::to_string(account_id) + ",'" + by_esc + "') "
+            "ON DUPLICATE KEY UPDATE `banned_by`='" + by_esc + "',`banned_until`=NULL";
+    } else {
+        sql = "INSERT INTO `voice_bans` (`account_id`,`banned_by`,`banned_until`) VALUES ("
+            + std::to_string(account_id) + ",'" + by_esc + "',FROM_UNIXTIME("
+            + std::to_string((long long)until) + ")) "
+            "ON DUPLICATE KEY UPDATE `banned_by`='" + by_esc + "',`banned_until`=FROM_UNIXTIME("
+            + std::to_string((long long)until) + ")";
+    }
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_insert_ban: %s", mysql_error(g_db));
+}
+
+static void db_delete_ban(int account_id) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    std::string sql = "DELETE FROM `voice_bans` WHERE `account_id`=" + std::to_string(account_id);
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_delete_ban: %s", mysql_error(g_db));
+}
+
 struct ClientSession;
 using VoiceSocket = VoiceTcp::Connection<false, true, ClientSession>;
 
@@ -495,6 +588,12 @@ static std::atomic<bool> g_war_active{false};
 struct FloodBan { uint32_t until_tick = 0; };
 static std::unordered_map<std::string, FloodBan> g_flood_bans;
 static constexpr uint32_t FLOOD_BAN_DURATION_MS = 300000; // 5 minutes
+
+// ── Admin mute (char_id → unmute time_t, 0 = permanent until @voiceunmute)
+static std::unordered_map<int, time_t> g_admin_muted;  // not persisted, clears on restart
+
+// ── Admin ban (account_id → expiry time_t, 0 = permanent)
+static std::unordered_map<int, time_t> g_admin_banned; // persisted in voice_bans table
 
 // ── Pre-built lookup indexes (maintained under g_session_mtx) ────────────────
 // Replaces O(n) full-scan with O(members_in_channel) per audio packet.
@@ -745,6 +844,24 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
     if (!to.authed) return false;
     if (to.deafened) return false;
     if (from.char_id == to.char_id) return false;
+
+    // Voice-banned sender — audio silenced, can still connect and hear
+    if (from.account_id > 0) {
+        auto bit = g_admin_banned.find(from.account_id);
+        if (bit != g_admin_banned.end()) {
+            if (bit->second == 0 || time(nullptr) < bit->second)
+                return false;
+        }
+    }
+
+    // GM-muted sender — no one hears them
+    {
+        auto mit = g_admin_muted.find(from.char_id);
+        if (mit != g_admin_muted.end()) {
+            if (mit->second == 0 || time(nullptr) < mit->second)
+                return false;
+        }
+    }
 
     // Block voice on restricted maps — check per-player level/job/group_id
     if (voice_db_map_blocked(from.map, from.level, from.job, from.group_id) ||
@@ -1134,6 +1251,29 @@ static void udp_position_loop() {
                     }
                 }
 
+                // Expire admin mutes
+                {
+                    time_t now_t = time(nullptr);
+                    for (auto it = g_admin_muted.begin(); it != g_admin_muted.end(); ) {
+                        if (it->second != 0 && now_t >= it->second) {
+                            LOG_INFO("admin_mute expired char_id=%d", it->first);
+                            it = g_admin_muted.erase(it);
+                        } else ++it;
+                    }
+                    // Expire admin bans
+                    std::vector<int> expired_bans;
+                    for (auto it = g_admin_banned.begin(); it != g_admin_banned.end(); ) {
+                        if (it->second != 0 && now_t >= it->second) {
+                            LOG_INFO("admin_ban expired account_id=%d", it->first);
+                            expired_bans.push_back(it->first);
+                            it = g_admin_banned.erase(it);
+                        } else ++it;
+                    }
+                    // DB deletes outside the session lock to avoid holding both locks
+                    for (int aid : expired_bans)
+                        db_delete_ban(aid);
+                }
+
                 // Kick provisional sessions whose advisory never arrived within
                 // the grace window. Collect here; actual ws->end() has to run
                 // on the server loop, so defer after releasing the lock.
@@ -1272,6 +1412,145 @@ static void udp_position_loop() {
                 }
             }
             LOG_NOTICE("guild_war_state active=%d", active ? 1 : 0);
+            continue;
+        }
+
+        if (type == "admin_mute") {
+            int cid = j.value("char_id", 0);
+            int dur = j.value("duration", 0); // seconds, 0 = permanent
+            if (cid > 0) {
+                time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                g_admin_muted[cid] = until;
+                if (dur > 0)
+                    LOG_NOTICE("admin_mute char_id=%d duration=%ds", cid, dur);
+                else
+                    LOG_NOTICE("admin_mute char_id=%d permanent", cid);
+            }
+            continue;
+        }
+
+        if (type == "admin_unmute") {
+            int cid = j.value("char_id", 0);
+            if (cid > 0) {
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                g_admin_muted.erase(cid);
+                LOG_NOTICE("admin_unmute char_id=%d", cid);
+            }
+            continue;
+        }
+
+        if (type == "admin_ban") {
+            int aid = j.value("account_id", 0);
+            int dur = j.value("duration", 0);
+            if (aid > 0) {
+                time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
+                VoiceSocket* target_ws = nullptr;
+                {
+                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    g_admin_banned[aid] = until;
+                    for (auto& kv : g_by_char_id) {
+                        ClientSession* s = kv.second;
+                        if (s && s->authed && s->account_id == aid) {
+                            target_ws = s->ws; break;
+                        }
+                    }
+                }
+                db_insert_ban(aid, j.value("banned_by", "admin"), until);
+                if (target_ws && g_voice_loop.load()) {
+                    g_voice_loop.load()->defer([target_ws]() {
+                        target_ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                    });
+                }
+                LOG_NOTICE("admin_ban account_id=%d dur=%ds", aid, dur);
+            }
+            continue;
+        }
+
+        if (type == "admin_unban") {
+            int aid = j.value("account_id", 0);
+            if (aid > 0) {
+                VoiceSocket* target_ws = nullptr;
+                {
+                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    g_admin_banned.erase(aid);
+                    for (auto& kv : g_by_char_id) {
+                        ClientSession* s = kv.second;
+                        if (s && s->authed && s->account_id == aid) {
+                            target_ws = s->ws; break;
+                        }
+                    }
+                }
+                db_delete_ban(aid);
+                if (target_ws && g_voice_loop.load()) {
+                    g_voice_loop.load()->defer([target_ws]() {
+                        target_ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                    });
+                }
+                LOG_NOTICE("admin_unban account_id=%d", aid);
+            }
+            continue;
+        }
+
+        if (type == "admin_ban_by_name") {
+            const std::string name = j.value("char_name", "");
+            int dur = j.value("duration", 0);
+            if (!name.empty()) {
+                int aid = db_lookup_account_id_by_name(name);
+                if (aid <= 0) {
+                    LOG_WARNING("admin_ban_by_name: char '%s' not found", name.c_str());
+                } else {
+                    time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
+                    VoiceSocket* target_ws = nullptr;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        g_admin_banned[aid] = until;
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid) {
+                                target_ws = s->ws; break;
+                            }
+                        }
+                    }
+                    db_insert_ban(aid, j.value("banned_by", "admin"), until);
+                    if (target_ws && g_voice_loop.load()) {
+                        g_voice_loop.load()->defer([target_ws]() {
+                            target_ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                        });
+                    }
+                    LOG_NOTICE("admin_ban_by_name '%s' account_id=%d dur=%ds", name.c_str(), aid, dur);
+                }
+            }
+            continue;
+        }
+
+        if (type == "admin_unban_by_name") {
+            const std::string name = j.value("char_name", "");
+            if (!name.empty()) {
+                int aid = db_lookup_account_id_by_name(name);
+                if (aid <= 0) {
+                    LOG_WARNING("admin_unban_by_name: char '%s' not found", name.c_str());
+                } else {
+                    VoiceSocket* target_ws = nullptr;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        g_admin_banned.erase(aid);
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid) {
+                                target_ws = s->ws; break;
+                            }
+                        }
+                    }
+                    db_delete_ban(aid);
+                    if (target_ws && g_voice_loop.load()) {
+                        g_voice_loop.load()->defer([target_ws]() {
+                            target_ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                        });
+                    }
+                    LOG_NOTICE("admin_unban_by_name '%s' account_id=%d", name.c_str(), aid);
+                }
+            }
             continue;
         }
 
@@ -1790,6 +2069,9 @@ void run_server() {
 
     if (!db_connect()) {
         LOG_WARNING("DB not available — party/guild channels will not work until connected");
+    } else {
+        db_ensure_ban_table();
+        db_load_bans(g_admin_banned);
     }
 
     // Capture the server loop before any clients connect so Ctrl+C/SIGTERM can
@@ -2052,6 +2334,15 @@ void run_server() {
                                s->char_name.c_str(), s->ip.c_str(),
                                s->party_id, s->guild_id, online_snapshot);
                     send_json(ws, json{{"type", "auth_ok"}});
+                    // Notify DLL if this account is currently voice-banned
+                    {
+                        auto bit = g_admin_banned.find(s->account_id);
+                        if (bit != g_admin_banned.end()) {
+                            const time_t now = time(nullptr);
+                            if (bit->second == 0 || now < bit->second)
+                                send_json(ws, json{{"type", "admin_banned"}});
+                        }
+                    }
                     send_json(ws, make_war_state_json(*s));
                     // Push initial position so the DLL knows where the player is
                     // immediately — without this it stays at (0,0) until the next

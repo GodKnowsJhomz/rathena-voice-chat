@@ -4445,6 +4445,101 @@ ACMD_FUNC(reloadvoicedb){
 	return 0;
 }
 
+// ── Voice admin commands ───────────────────────────────────────────────────────
+// Time format: +/-<value><unit>  y=Year m=Month d=Day h=Hour n=Minute s=Second
+// Examples:  @voicemute PlayerName +1h   @voiceban PlayerName +7d
+
+static int voice_parse_duration(const char* time_str) {
+	if (!time_str || !time_str[0]) return 0;
+	return (int)solve_time(const_cast<char*>(time_str));
+}
+
+ACMD_FUNC(voicemute) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	char time_str[64] = {};
+	if (!message || !*message || sscanf(message, "%23s %63[^\n]", player_name, time_str) < 1) {
+		clif_displaymessage(fd, "Usage: @voicemute <player> [+time]  e.g. +1h +30n +7d");
+		return -1;
+	}
+	int duration_sec = voice_parse_duration(time_str);
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (!pl_sd) {
+		clif_displaymessage(fd, msg_txt(sd, 3));
+		return -1;
+	}
+	voice_bridge_send_admin_mute(pl_sd->status.char_id, duration_sec);
+	char output[128];
+	if (duration_sec > 0)
+		snprintf(output, sizeof(output), "Voice muted '%s' for %ds.", pl_sd->status.name, duration_sec);
+	else
+		snprintf(output, sizeof(output), "Voice muted '%s' permanently.", pl_sd->status.name);
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
+ACMD_FUNC(voiceunmute) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	if (!message || !*message || sscanf(message, "%23[^\n]", player_name) < 1) {
+		clif_displaymessage(fd, "Usage: @voiceunmute <player>");
+		return -1;
+	}
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (!pl_sd) {
+		clif_displaymessage(fd, msg_txt(sd, 3));
+		return -1;
+	}
+	voice_bridge_send_admin_unmute(pl_sd->status.char_id);
+	char output[128];
+	snprintf(output, sizeof(output), "Voice unmuted '%s'.", pl_sd->status.name);
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
+ACMD_FUNC(voiceban) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	char time_str[64] = {};
+	if (!message || !*message || sscanf(message, "%23s %63[^\n]", player_name, time_str) < 1) {
+		clif_displaymessage(fd, "Usage: @voiceban <player> [+time]  e.g. +1h +30n +7d");
+		return -1;
+	}
+	int duration_sec = voice_parse_duration(time_str);
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (pl_sd) {
+		voice_bridge_send_admin_ban(pl_sd->status.account_id, duration_sec);
+	} else {
+		voice_bridge_send_admin_ban_by_name(player_name, duration_sec);
+	}
+	char output[128];
+	if (duration_sec > 0)
+		snprintf(output, sizeof(output), "Voice banned '%s' for %ds%s.", player_name, duration_sec, pl_sd ? "" : " (offline)");
+	else
+		snprintf(output, sizeof(output), "Voice banned '%s' permanently%s.", player_name, pl_sd ? "" : " (offline)");
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
+ACMD_FUNC(voiceunban) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	if (!message || !*message || sscanf(message, "%23[^\n]", player_name) < 1) {
+		clif_displaymessage(fd, "Usage: @voiceunban <player>");
+		return -1;
+	}
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (pl_sd) {
+		voice_bridge_send_admin_unban(pl_sd->status.account_id);
+	} else {
+		voice_bridge_send_admin_unban_by_name(player_name);
+	}
+	char output[128];
+	snprintf(output, sizeof(output), "Voice unbanned '%s'%s.", player_name, pl_sd ? "" : " (offline)");
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
 ACMD_FUNC(reloadbattleconf){
 	nullpo_retr(-1, sd);
 
@@ -11815,6 +11910,10 @@ void atcommand_basecommands(void) {
 		ACMD_DEFR(roulette, ATCMD_NOCONSOLE|ATCMD_NOAUTOTRADE),
 		ACMD_DEF(setcard),
 		ACMD_DEF(macrochecker),
+		ACMD_DEF(voicemute),
+		ACMD_DEF(voiceunmute),
+		ACMD_DEF(voiceban),
+		ACMD_DEF(voiceunban),
 	};
 	AtCommandInfo* atcommand;
 	int32 i;
