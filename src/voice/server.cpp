@@ -1219,9 +1219,12 @@ static void udp_position_loop() {
             // Sessions whose advisory grace window expired — collected under
                 // the lock, kicked after releasing it (ws->end must run on the server loop).
             std::vector<std::pair<int, uint64_t>> advisory_timeout_kicks;
-            // Admin ban expiries — DB delete + DLL notify happen after lock release
-            std::vector<int>          expired_admin_bans;
-            std::vector<VoiceSocket*> expired_unban_notify_ws;
+            // Admin ban expiries — DB delete + DLL notify happen after lock release.
+            // We capture account_id (not ws*) for the notify path so the defer
+            // can re-look-up the session under the lock and avoid use-after-free
+            // if the player disconnected between expiry and notify execution.
+            std::vector<int> expired_admin_bans;
+            std::vector<int> expired_notify_account_ids;
 
             // 1. Pending position TTL — drop positions for players who never authed
             {
@@ -1271,10 +1274,12 @@ static void udp_position_loop() {
                             const int aid = it->first;
                             LOG_INFO("admin_ban expired account_id=%d", aid);
                             expired_admin_bans.push_back(aid);
+                            // Note: only schedule a notify if a session is currently
+                            // online for this aid. The defer re-validates under the lock.
                             for (auto& kv : g_by_char_id) {
                                 ClientSession* s = kv.second;
-                                if (s && s->authed && s->account_id == aid && s->ws) {
-                                    expired_unban_notify_ws.push_back(s->ws);
+                                if (s && s->authed && s->account_id == aid) {
+                                    expired_notify_account_ids.push_back(aid);
                                     break;
                                 }
                             }
@@ -1299,12 +1304,22 @@ static void udp_position_loop() {
             // ── Now that g_session_mtx is released, run DB writes / WS notifies ─
             for (int aid : expired_admin_bans)
                 db_delete_ban(aid);
-            if (!expired_unban_notify_ws.empty() && g_voice_loop.load()) {
-                auto ws_list = std::move(expired_unban_notify_ws);
-                g_voice_loop.load()->defer([ws_list = std::move(ws_list)]() {
-                    for (auto* ws : ws_list) {
-                        ws->send(json{{"type","admin_unbanned"}}.dump(),
-                                 VoiceTcp::OpCode::TEXT);
+            if (!expired_notify_account_ids.empty() && g_voice_loop.load()) {
+                auto aids = std::move(expired_notify_account_ids);
+                g_voice_loop.load()->defer([aids = std::move(aids)]() {
+                    // Re-look up under the lock so the ws pointer cannot be freed
+                    // mid-send by a concurrent disconnect.
+                    std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                    const std::string payload =
+                        json{{"type","admin_unbanned"}}.dump();
+                    for (int aid : aids) {
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(payload, VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
                     }
                 });
             }
@@ -1467,21 +1482,28 @@ static void udp_position_loop() {
             int dur = j.value("duration", 0);
             if (aid > 0) {
                 time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
-                VoiceSocket* target_ws = nullptr;
+                bool has_session = false;
                 {
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                     g_admin_banned[aid] = until;
                     for (auto& kv : g_by_char_id) {
                         ClientSession* s = kv.second;
                         if (s && s->authed && s->account_id == aid) {
-                            target_ws = s->ws; break;
+                            has_session = true; break;
                         }
                     }
                 }
                 db_insert_ban(aid, j.value("banned_by", "admin"), until);
-                if (target_ws && g_voice_loop.load()) {
-                    g_voice_loop.load()->defer([target_ws]() {
-                        target_ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                if (has_session && g_voice_loop.load()) {
+                    g_voice_loop.load()->defer([aid]() {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
                     });
                 }
                 LOG_NOTICE("admin_ban account_id=%d dur=%ds", aid, dur);
@@ -1492,21 +1514,28 @@ static void udp_position_loop() {
         if (type == "admin_unban") {
             int aid = j.value("account_id", 0);
             if (aid > 0) {
-                VoiceSocket* target_ws = nullptr;
+                bool has_session = false;
                 {
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                     g_admin_banned.erase(aid);
                     for (auto& kv : g_by_char_id) {
                         ClientSession* s = kv.second;
                         if (s && s->authed && s->account_id == aid) {
-                            target_ws = s->ws; break;
+                            has_session = true; break;
                         }
                     }
                 }
                 db_delete_ban(aid);
-                if (target_ws && g_voice_loop.load()) {
-                    g_voice_loop.load()->defer([target_ws]() {
-                        target_ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                if (has_session && g_voice_loop.load()) {
+                    g_voice_loop.load()->defer([aid]() {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
                     });
                 }
                 LOG_NOTICE("admin_unban account_id=%d", aid);
@@ -1523,21 +1552,28 @@ static void udp_position_loop() {
                     LOG_WARNING("admin_ban_by_name: char '%s' not found", name.c_str());
                 } else {
                     time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
-                    VoiceSocket* target_ws = nullptr;
+                    bool has_session = false;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         g_admin_banned[aid] = until;
                         for (auto& kv : g_by_char_id) {
                             ClientSession* s = kv.second;
                             if (s && s->authed && s->account_id == aid) {
-                                target_ws = s->ws; break;
+                                has_session = true; break;
                             }
                         }
                     }
                     db_insert_ban(aid, j.value("banned_by", "admin"), until);
-                    if (target_ws && g_voice_loop.load()) {
-                        g_voice_loop.load()->defer([target_ws]() {
-                            target_ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                    if (has_session && g_voice_loop.load()) {
+                        g_voice_loop.load()->defer([aid]() {
+                            std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                            for (auto& kv : g_by_char_id) {
+                                ClientSession* s = kv.second;
+                                if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                    s->ws->send(json{{"type","admin_banned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                    break;
+                                }
+                            }
                         });
                     }
                     LOG_NOTICE("admin_ban_by_name '%s' account_id=%d dur=%ds", name.c_str(), aid, dur);
@@ -1553,21 +1589,28 @@ static void udp_position_loop() {
                 if (aid <= 0) {
                     LOG_WARNING("admin_unban_by_name: char '%s' not found", name.c_str());
                 } else {
-                    VoiceSocket* target_ws = nullptr;
+                    bool has_session = false;
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                         g_admin_banned.erase(aid);
                         for (auto& kv : g_by_char_id) {
                             ClientSession* s = kv.second;
                             if (s && s->authed && s->account_id == aid) {
-                                target_ws = s->ws; break;
+                                has_session = true; break;
                             }
                         }
                     }
                     db_delete_ban(aid);
-                    if (target_ws && g_voice_loop.load()) {
-                        g_voice_loop.load()->defer([target_ws]() {
-                            target_ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                    if (has_session && g_voice_loop.load()) {
+                        g_voice_loop.load()->defer([aid]() {
+                            std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                            for (auto& kv : g_by_char_id) {
+                                ClientSession* s = kv.second;
+                                if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                    s->ws->send(json{{"type","admin_unbanned"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                    break;
+                                }
+                            }
                         });
                     }
                     LOG_NOTICE("admin_unban_by_name '%s' account_id=%d", name.c_str(), aid);
@@ -2356,6 +2399,7 @@ void run_server() {
                     send_json(ws, json{{"type", "auth_ok"}});
                     // Notify DLL if this account is currently voice-banned
                     {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
                         auto bit = g_admin_banned.find(s->account_id);
                         if (bit != g_admin_banned.end()) {
                             const time_t now = time(nullptr);
