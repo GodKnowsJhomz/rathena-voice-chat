@@ -1219,6 +1219,9 @@ static void udp_position_loop() {
             // Sessions whose advisory grace window expired — collected under
                 // the lock, kicked after releasing it (ws->end must run on the server loop).
             std::vector<std::pair<int, uint64_t>> advisory_timeout_kicks;
+            // Admin ban expiries — DB delete + DLL notify happen after lock release
+            std::vector<int>          expired_admin_bans;
+            std::vector<VoiceSocket*> expired_unban_notify_ws;
 
             // 1. Pending position TTL — drop positions for players who never authed
             {
@@ -1261,18 +1264,23 @@ static void udp_position_loop() {
                             it = g_admin_muted.erase(it);
                         } else ++it;
                     }
-                    // Expire admin bans
-                    std::vector<int> expired_bans;
+                    // Expire admin bans — collect here; DB delete + notify
+                    // happen after we release the session lock.
                     for (auto it = g_admin_banned.begin(); it != g_admin_banned.end(); ) {
                         if (it->second != 0 && now_t >= it->second) {
-                            LOG_INFO("admin_ban expired account_id=%d", it->first);
-                            expired_bans.push_back(it->first);
+                            const int aid = it->first;
+                            LOG_INFO("admin_ban expired account_id=%d", aid);
+                            expired_admin_bans.push_back(aid);
+                            for (auto& kv : g_by_char_id) {
+                                ClientSession* s = kv.second;
+                                if (s && s->authed && s->account_id == aid && s->ws) {
+                                    expired_unban_notify_ws.push_back(s->ws);
+                                    break;
+                                }
+                            }
                             it = g_admin_banned.erase(it);
                         } else ++it;
                     }
-                    // DB deletes outside the session lock to avoid holding both locks
-                    for (int aid : expired_bans)
-                        db_delete_ban(aid);
                 }
 
                 // Kick provisional sessions whose advisory never arrived within
@@ -1286,6 +1294,19 @@ static void udp_position_loop() {
                         advisory_timeout_kicks.push_back({ s->char_id, s->session_id });
                     }
                 }
+            }
+
+            // ── Now that g_session_mtx is released, run DB writes / WS notifies ─
+            for (int aid : expired_admin_bans)
+                db_delete_ban(aid);
+            if (!expired_unban_notify_ws.empty() && g_voice_loop.load()) {
+                auto ws_list = std::move(expired_unban_notify_ws);
+                g_voice_loop.load()->defer([ws_list = std::move(ws_list)]() {
+                    for (auto* ws : ws_list) {
+                        ws->send(json{{"type","admin_unbanned"}}.dump(),
+                                 VoiceTcp::OpCode::TEXT);
+                    }
+                });
             }
 
             if (!advisory_timeout_kicks.empty() && g_voice_loop.load()) {
