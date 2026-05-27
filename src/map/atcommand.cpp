@@ -4554,7 +4554,10 @@ ACMD_FUNC(voicegrant) {
 		clif_displaymessage(fd, msg_txt(sd, 3));
 		return -1;
 	}
-	voice_bridge_send_grant_license(pl_sd->status.account_id, duration_sec);
+	if (!voice_bridge_send_grant_license(pl_sd->status.account_id, duration_sec)) {
+		clif_displaymessage(fd, "Voice server unavailable — license NOT granted.");
+		return -1;
+	}
 	char output[128];
 	if (duration_sec > 0)
 		snprintf(output, sizeof(output), "Voice license granted to '%s' for %ds.", pl_sd->status.name, duration_sec);
@@ -4576,7 +4579,10 @@ ACMD_FUNC(voicerevoke) {
 		clif_displaymessage(fd, msg_txt(sd, 3));
 		return -1;
 	}
-	voice_bridge_send_revoke_license(pl_sd->status.account_id);
+	if (!voice_bridge_send_revoke_license(pl_sd->status.account_id)) {
+		clif_displaymessage(fd, "Voice server unavailable — revoke NOT sent.");
+		return -1;
+	}
 	char output[128];
 	snprintf(output, sizeof(output), "Voice license revoked from '%s'.", pl_sd->status.name);
 	clif_displaymessage(fd, output);

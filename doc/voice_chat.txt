@@ -106,7 +106,11 @@ voicerevoke {<account_id>};
   Used inside item or NPC scripts. Sends a UDP command to the voice
   server. The duration is in seconds; 0 means permanent.
 
-  Example item entry (db/import/item_db.yml):
+  Both push 1 on success (UDP packet queued) or 0 if the voice bridge
+  is not ready (voice server unreachable). Scripts can branch on the
+  result to handle voice-server outages gracefully.
+
+  Item script (simplest — accepts that item is lost on voice outage):
 
     - Id: 31000
       AegisName: Voice_Mobile_Perm
@@ -116,13 +120,20 @@ voicerevoke {<account_id>};
       Script: |
         voicegrant(0);
 
-    - Id: 31001
-      AegisName: Voice_Mobile_30D
-      Name: Voice Mobile (30 Days)
-      Type: Usable
-      Buy: 200000
-      Script: |
-        voicegrant(2592000);    // 30 * 24 * 3600
+  NPC script (charge-on-success — recommended for production):
+
+      prontera,150,150,4   script   Voice Shop   100,{
+          mes "Buy a permanent voice license for 1,000,000z?";
+          if (select("Yes:No") == 2) close;
+          if (Zeny < 1000000) { mes "Not enough zeny."; close; }
+          if (voicegrant(0) == 0) {
+              mes "Voice server is unavailable. Please try again later.";
+              close;
+          }
+          Zeny -= 1000000;
+          mes "Permanent voice license activated.";
+          close;
+      }
 
   voicerevoke without an argument acts on the attached player; with an
   account_id it can be used from a non-player script context.

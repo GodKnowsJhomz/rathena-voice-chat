@@ -526,21 +526,23 @@ void voice_bridge_send_admin_unban_by_name(const char* char_name) {
 	voice_bridge_send_text(buf);
 }
 
-void voice_bridge_send_grant_license(int account_id, int duration_sec) {
-	if (!g_ready || account_id <= 0) return;
+bool voice_bridge_send_grant_license(int account_id, int duration_sec) {
+	if (!g_ready || account_id <= 0) return false;
 	char buf[96];
 	std::snprintf(buf, sizeof(buf),
 		"{\"type\":\"grant_license\",\"account_id\":%d,\"duration\":%d}",
 		account_id, duration_sec);
 	voice_bridge_send_text(buf);
+	return true;
 }
 
-void voice_bridge_send_revoke_license(int account_id) {
-	if (!g_ready || account_id <= 0) return;
+bool voice_bridge_send_revoke_license(int account_id) {
+	if (!g_ready || account_id <= 0) return false;
 	char buf[64];
 	std::snprintf(buf, sizeof(buf),
 		"{\"type\":\"revoke_license\",\"account_id\":%d}", account_id);
 	voice_bridge_send_text(buf);
+	return true;
 }
 
 void voice_bridge_send_leave(map_session_data* sd) {

@@ -11811,14 +11811,23 @@ Only meaningful when conf/voice_athena.conf has
 'voice_license_required: 1'. With license mode off, the call still
 records the row in the DB but has no gameplay effect.
 
+Returns 1 on success (UDP packet queued), 0 if the voice bridge is
+not ready (voice server unreachable). Scripts SHOULD branch on the
+result so a voice-server outage does not silently destroy items /
+zeny while granting nothing.
+
 Example:
     voicegrant(0);            // permanent
     voicegrant(2592000);      // 30 days
     voicegrant(604800);       // 7 days
 
-Typical usage is from a consumable item's Script: field.
+    if (voicegrant(0) == 0) {
+        mes "Voice server unavailable.";
+        close;
+    }
 
-See doc/voice_chat.txt for the full voice chat reference.
+See doc/voice_chat.txt for the full voice chat reference and a
+recommended NPC shop pattern.
 
 ---------------------------------------
 
@@ -11829,6 +11838,9 @@ With no argument acts on the attached player. With an account_id
 it can be called from any script context (NPC, console, etc).
 Deletes the row from voice_licenses and notifies the player's DLL
 in real time if they are online and license mode is enabled.
+
+Returns 1 on success, 0 if the voice bridge is not ready or no
+player is attached and no account_id was given.
 
 Example:
     voicerevoke;              // revoke from the attached player

@@ -434,6 +434,39 @@ static void db_delete_ban(int account_id) {
         LOG_ERROR("db_delete_ban: %s", mysql_error(g_db));
 }
 
+// Maintenance-only delete that ignores rows which have been re-issued after
+// the in-memory expiry sweep but before this DELETE runs.
+static void db_delete_expired_ban(int account_id) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    std::string sql = "DELETE FROM `voice_bans` WHERE `account_id`="
+        + std::to_string(account_id)
+        + " AND `banned_until` IS NOT NULL AND `banned_until` <= NOW()";
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_delete_expired_ban: %s", mysql_error(g_db));
+}
+
+// Called at startup to clean up rows that elapsed while the voice server
+// was offline. Without this they would stay in the DB forever because
+// db_load_bans / db_load_licenses skip expired rows (so the maintenance
+// sweep never sees them in memory).
+static void db_purge_expired_rows() {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* q1 = "DELETE FROM `voice_bans`     WHERE `banned_until` IS NOT NULL AND `banned_until` <= NOW()";
+    const char* q2 = "DELETE FROM `voice_licenses` WHERE `expires_at`   IS NOT NULL AND `expires_at`   <= NOW()";
+    if (mysql_query(g_db, q1) != 0)
+        LOG_ERROR("db_purge_expired_rows (bans): %s", mysql_error(g_db));
+    else if (mysql_affected_rows(g_db) > 0)
+        LOG_INFO("startup cleanup: purged %llu expired voice_bans rows",
+                 (unsigned long long)mysql_affected_rows(g_db));
+    if (mysql_query(g_db, q2) != 0)
+        LOG_ERROR("db_purge_expired_rows (licenses): %s", mysql_error(g_db));
+    else if (mysql_affected_rows(g_db) > 0)
+        LOG_INFO("startup cleanup: purged %llu expired voice_licenses rows",
+                 (unsigned long long)mysql_affected_rows(g_db));
+}
+
 // ── Voice license DB ──────────────────────────────────────────────────────────
 static void db_ensure_license_table() {
     std::lock_guard<std::mutex> lock(g_db_mtx);
@@ -502,6 +535,19 @@ static void db_delete_license(int account_id) {
     std::string sql = "DELETE FROM `voice_licenses` WHERE `account_id`=" + std::to_string(account_id);
     if (mysql_query(g_db, sql.c_str()) != 0)
         LOG_ERROR("db_delete_license: %s", mysql_error(g_db));
+}
+
+// Same as db_delete_license but only matches expired rows. Used by the
+// maintenance sweep so a race-condition re-grant that lands between the
+// in-memory erase and this DELETE does not nuke a freshly-issued license.
+static void db_delete_expired_license(int account_id) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    std::string sql = "DELETE FROM `voice_licenses` WHERE `account_id`="
+        + std::to_string(account_id)
+        + " AND `expires_at` IS NOT NULL AND `expires_at` <= NOW()";
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_delete_expired_license: %s", mysql_error(g_db));
 }
 
 struct ClientSession;
@@ -1447,7 +1493,7 @@ static void udp_position_loop() {
 
             // ── Now that g_session_mtx is released, run DB writes / WS notifies ─
             for (int aid : expired_admin_bans)
-                db_delete_ban(aid);
+                db_delete_expired_ban(aid);
             if (!expired_notify_account_ids.empty() && g_voice_loop.load()) {
                 auto aids = std::move(expired_notify_account_ids);
                 g_voice_loop.load()->defer([aids = std::move(aids)]() {
@@ -1468,7 +1514,7 @@ static void udp_position_loop() {
                 });
             }
             for (int aid : expired_licenses)
-                db_delete_license(aid);
+                db_delete_expired_license(aid);
             if (!expired_license_notify_account_ids.empty() && g_voice_loop.load()
                 && g_cfg.voice_license_required) {
                 auto aids = std::move(expired_license_notify_account_ids);
@@ -2369,8 +2415,9 @@ void run_server() {
         LOG_WARNING("DB not available — party/guild channels will not work until connected");
     } else {
         db_ensure_ban_table();
-        db_load_bans(g_admin_banned);
         db_ensure_license_table();
+        db_purge_expired_rows();
+        db_load_bans(g_admin_banned);
         db_load_licenses(g_voice_licenses);
     }
 

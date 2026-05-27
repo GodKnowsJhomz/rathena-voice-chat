@@ -27881,16 +27881,33 @@ BUILDIN_FUNC(mesemotion){
 /**
  * Grant a voice license to the attached player's account.
  *   voicegrant(<duration_sec>);    // 0 = permanent
+ *
  * Sent to the voice server via UDP voice_bridge; the server stores it
  * in `voice_licenses` and notifies the DLL.
+ *
+ * The buildin pushes 1 on success (UDP packet queued) or 0 if the voice
+ * bridge is not ready (voice server unreachable). The script command itself
+ * always returns SUCCESS so caller scripts can branch on the result:
+ *
+ *     if (voicegrant(0) == 0) {
+ *         mes "Voice server unavailable, please try again later.";
+ *         close;
+ *     }
  */
 BUILDIN_FUNC(voicegrant) {
 	map_session_data* sd = nullptr;
-	if (!script_rid2sd(sd))
-		return SCRIPT_CMD_FAILURE;
+	if (!script_rid2sd(sd)) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_SUCCESS;
+	}
 	int duration = script_getnum(st, 2);
 	if (duration < 0) duration = 0;
-	voice_bridge_send_grant_license(sd->status.account_id, duration);
+	const bool sent = voice_bridge_send_grant_license(sd->status.account_id, duration);
+	if (!sent) {
+		ShowWarning("buildin_voicegrant: voice bridge not ready, license NOT granted for account_id=%d\n",
+			sd->status.account_id);
+	}
+	script_pushint(st, sent ? 1 : 0);
 	return SCRIPT_CMD_SUCCESS;
 }
 
@@ -27898,6 +27915,8 @@ BUILDIN_FUNC(voicegrant) {
  * Revoke voice license from the attached player (or by account_id when given).
  *   voicerevoke;            // attached player
  *   voicerevoke <aid>;      // explicit account_id
+ *
+ * Pushes 1 on success, 0 if the bridge isn't ready or no player is attached.
  */
 BUILDIN_FUNC(voicerevoke) {
 	int aid = 0;
@@ -27905,12 +27924,21 @@ BUILDIN_FUNC(voicerevoke) {
 		aid = script_getnum(st, 2);
 	} else {
 		map_session_data* sd = nullptr;
-		if (!script_rid2sd(sd))
-			return SCRIPT_CMD_FAILURE;
+		if (!script_rid2sd(sd)) {
+			script_pushint(st, 0);
+			return SCRIPT_CMD_SUCCESS;
+		}
 		aid = sd->status.account_id;
 	}
-	if (aid <= 0) return SCRIPT_CMD_FAILURE;
-	voice_bridge_send_revoke_license(aid);
+	if (aid <= 0) {
+		script_pushint(st, 0);
+		return SCRIPT_CMD_SUCCESS;
+	}
+	const bool sent = voice_bridge_send_revoke_license(aid);
+	if (!sent) {
+		ShowWarning("buildin_voicerevoke: voice bridge not ready, revoke NOT sent for account_id=%d\n", aid);
+	}
+	script_pushint(st, sent ? 1 : 0);
 	return SCRIPT_CMD_SUCCESS;
 }
 
