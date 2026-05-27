@@ -584,9 +584,10 @@ static std::unordered_map<int, AuthAdvisory> g_auth_advisories; // by char_id
 static constexpr uint32_t AUTH_ADVISORY_TTL_MS = 120000; // 2 minutes
 static std::atomic<bool> g_war_active{false};
 
-// ── IP flood-ban list (populated when a client trips FLOOD_VIOLATION_THRESHOLD)
+// ── Per-account flood-ban list (populated when a client trips FLOOD_VIOLATION_THRESHOLD)
+// Keyed on account_id so families sharing a NAT/router are not collaterally banned.
 struct FloodBan { uint32_t until_tick = 0; };
-static std::unordered_map<std::string, FloodBan> g_flood_bans;
+static std::unordered_map<int, FloodBan> g_flood_bans;
 static constexpr uint32_t FLOOD_BAN_DURATION_MS = 300000; // 5 minutes
 
 // ── Admin mute (char_id → unmute time_t, 0 = permanent until @voiceunmute)
@@ -1241,10 +1242,10 @@ static void udp_position_loop() {
                     }
                 }
 
-                // Expire IP flood bans
+                // Expire per-account flood bans
                 for (auto it = g_flood_bans.begin(); it != g_flood_bans.end(); ) {
                     if ((int32_t)(now_maint - it->second.until_tick) >= 0) {
-                        LOG_INFO("flood_ban expired ip=%s", it->first.c_str());
+                        LOG_INFO("flood_ban expired account_id=%d", it->first);
                         it = g_flood_bans.erase(it);
                     } else {
                         ++it;
@@ -2094,31 +2095,10 @@ void run_server() {
         .open = [](auto* ws) {
             auto* s = ws->getUserData();
             s->ws = ws;
-            std::string ip = normalize_ip(ws->getRemoteAddressAsText());
-            bool ip_banned = false;
-
-            // IP flood-ban check — refuse connection if this IP is currently banned
             {
                 std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                auto bit = g_flood_bans.find(ip);
-                if (bit != g_flood_bans.end()) {
-                    if (tick_ms() < bit->second.until_tick) {
-                        uint32_t remain = (bit->second.until_tick - tick_ms()) / 1000;
-                        LOG_WARNING("IP banned %s — refusing connection (%u s left)", ip.c_str(), remain);
-                        ip_banned = true;
-                    }
-                    // stale entry — drop (maintenance will also sweep these)
-                    if (!ip_banned)
-                        g_flood_bans.erase(bit);
-                }
-                if (!ip_banned) {
-                    s->ip = std::move(ip);
-                    g_by_ws[ws] = s;
-                }
-            }
-            if (ip_banned) {
-                ws->end(1008, "ip banned");
-                return;
+                s->ip = normalize_ip(ws->getRemoteAddressAsText());
+                g_by_ws[ws] = s;
             }
             LOG_STATUS("connection from %s", s->ip.c_str());
         },
@@ -2218,6 +2198,25 @@ void run_server() {
                     s->party_id  = ci.party_id;
                     s->guild_id  = ci.guild_id;
                     s->db_refresh_tick = time(nullptr);
+
+                    // ── Per-account flood ban check ───────────────────────
+                    {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                        auto fit = g_flood_bans.find(s->account_id);
+                        if (fit != g_flood_bans.end()) {
+                            const uint32_t now_ms   = tick_ms();
+                            const uint32_t until_ms = fit->second.until_tick;
+                            // wrap-safe: ban still active iff signed (until - now) > 0
+                            if ((int32_t)(until_ms - now_ms) > 0) {
+                                const uint32_t remain_ms = until_ms - now_ms;
+                                LOG_WARNING("flood-banned account_id=%d — refusing auth (%u s left)",
+                                            s->account_id, remain_ms / 1000);
+                                send_json(ws, json{{"type","flood_banned"},{"duration_ms", remain_ms}});
+                                ws->end(1008, "flood ban");
+                                return;
+                            }
+                        }
+                    }
 
                     s->authed = true;
                     std::vector<SessionKick> sessions_to_close;
@@ -2619,14 +2618,14 @@ void run_server() {
                 if (!s->rate_limit_check()) {
                     LOG_WARNING("rate limit drop char_id=%d violations=%d", s->char_id, s->flood_violations);
                     if (s->is_flooding()) {
-                        // Sustained flood (~30 consecutive drops) → ban IP for 5 min
-                        LOG_ERROR("FLOOD BAN char_id=%d ip=%s — kicking and banning IP for 5 min",
-                                  s->char_id, s->ip.c_str());
+                        // Sustained flood (~30 consecutive drops) → ban account for 5 min
+                        LOG_ERROR("FLOOD BAN char_id=%d account_id=%d ip=%s — kicking and banning account for 5 min",
+                                  s->char_id, s->account_id, s->ip.c_str());
                         {
                             std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                            g_flood_bans[s->ip] = { tick_ms() + FLOOD_BAN_DURATION_MS };
+                            g_flood_bans[s->account_id] = { tick_ms() + FLOOD_BAN_DURATION_MS };
                         }
-                        send_json(ws, json{{"type","error"},{"message","flood detected — banned"}});
+                        send_json(ws, json{{"type","flood_banned"},{"duration_ms", FLOOD_BAN_DURATION_MS}});
                         ws->end(1008, "flood ban");
                     }
                     return;
