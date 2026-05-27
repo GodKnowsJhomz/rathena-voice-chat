@@ -59,6 +59,7 @@ struct SrvConfig {
     int         speaking_hat_timeout_ms = 900;
     bool        war_mode_enabled     = true;
     bool        war_allow_whisper    = true;
+    bool        voice_license_required = false; // gate audio TX behind a voice_licenses entry
 
     std::string db_host       = "127.0.0.1";
     int         db_port       = 3306;
@@ -167,6 +168,9 @@ static void load_voice_conf(const char* path) {
         }
         else if (key == "voice_war_allow_whisper") {
             if (!val.empty()) g_cfg.war_allow_whisper = (std::stoi(val) != 0); return true;
+        }
+        else if (key == "voice_license_required") {
+            if (!val.empty()) g_cfg.voice_license_required = (std::stoi(val) != 0); return true;
         }
         else if (key == "voice_client_secret") {
             g_cfg.client_secret = val; return true;
@@ -430,6 +434,76 @@ static void db_delete_ban(int account_id) {
         LOG_ERROR("db_delete_ban: %s", mysql_error(g_db));
 }
 
+// ── Voice license DB ──────────────────────────────────────────────────────────
+static void db_ensure_license_table() {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql =
+        "CREATE TABLE IF NOT EXISTS `voice_licenses` ("
+        "  `account_id` INT NOT NULL,"
+        "  `granted_by` VARCHAR(24) NOT NULL DEFAULT '',"
+        "  `granted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  `expires_at` DATETIME NULL DEFAULT NULL,"
+        "  PRIMARY KEY (`account_id`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    if (mysql_query(g_db, sql) != 0)
+        LOG_ERROR("db_ensure_license_table: %s", mysql_error(g_db));
+}
+
+static void db_load_licenses(std::unordered_map<int, time_t>& out) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql =
+        "SELECT `account_id`, UNIX_TIMESTAMP(`expires_at`) "
+        "FROM `voice_licenses` "
+        "WHERE `expires_at` IS NULL OR `expires_at` > NOW()";
+    if (mysql_query(g_db, sql) != 0) {
+        LOG_ERROR("db_load_licenses: %s", mysql_error(g_db));
+        return;
+    }
+    MYSQL_RES* res = mysql_store_result(g_db);
+    if (!res) return;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (!row[0]) continue;
+        int aid = std::atoi(row[0]);
+        time_t until = (row[1] && row[1][0]) ? (time_t)std::stoll(row[1]) : 0;
+        out[aid] = until;
+    }
+    mysql_free_result(res);
+    LOG_INFO("voice_licenses loaded %zu entry(ies)", out.size());
+}
+
+static void db_insert_license(int account_id, const std::string& granted_by, time_t until) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    char by_esc[100] = {};
+    mysql_real_escape_string(g_db, by_esc, granted_by.c_str(),
+                             (unsigned long)std::min(granted_by.size(), sizeof(by_esc) / 2 - 1));
+    std::string sql;
+    if (until == 0) {
+        sql = "INSERT INTO `voice_licenses` (`account_id`,`granted_by`) VALUES ("
+            + std::to_string(account_id) + ",'" + by_esc + "') "
+            "ON DUPLICATE KEY UPDATE `granted_by`='" + by_esc + "',`expires_at`=NULL";
+    } else {
+        sql = "INSERT INTO `voice_licenses` (`account_id`,`granted_by`,`expires_at`) VALUES ("
+            + std::to_string(account_id) + ",'" + by_esc + "',FROM_UNIXTIME("
+            + std::to_string((long long)until) + ")) "
+            "ON DUPLICATE KEY UPDATE `granted_by`='" + by_esc + "',`expires_at`=FROM_UNIXTIME("
+            + std::to_string((long long)until) + ")";
+    }
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_insert_license: %s", mysql_error(g_db));
+}
+
+static void db_delete_license(int account_id) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    std::string sql = "DELETE FROM `voice_licenses` WHERE `account_id`=" + std::to_string(account_id);
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_delete_license: %s", mysql_error(g_db));
+}
+
 struct ClientSession;
 using VoiceSocket = VoiceTcp::Connection<false, true, ClientSession>;
 
@@ -595,6 +669,10 @@ static std::unordered_map<int, time_t> g_admin_muted;  // not persisted, clears 
 
 // ── Admin ban (account_id → expiry time_t, 0 = permanent)
 static std::unordered_map<int, time_t> g_admin_banned; // persisted in voice_bans table
+
+// ── Voice license (account_id → expires time_t, 0 = permanent)
+// Only enforced when g_cfg.voice_license_required is true.
+static std::unordered_map<int, time_t> g_voice_licenses; // persisted in voice_licenses table
 
 // ── Pre-built lookup indexes (maintained under g_session_mtx) ────────────────
 // Replaces O(n) full-scan with O(members_in_channel) per audio packet.
@@ -853,6 +931,14 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
             if (bit->second == 0 || time(nullptr) < bit->second)
                 return false;
         }
+    }
+
+    // License gate — when enabled, sender must have an active license entry
+    if (g_cfg.voice_license_required && from.account_id > 0) {
+        auto lit = g_voice_licenses.find(from.account_id);
+        const bool has_license = lit != g_voice_licenses.end() &&
+                                 (lit->second == 0 || time(nullptr) < lit->second);
+        if (!has_license) return false;
     }
 
     // GM-muted sender — no one hears them
@@ -1133,6 +1219,45 @@ static void reload_voice_db_config() {
     g_config.voice_db_valid = true;
 }
 
+// Reload voice config and notify currently-connected sessions of any
+// state changes that should take effect immediately (e.g., toggling
+// voice_license_required on/off should not require players to relog).
+//
+// Must run on the server loop thread (i.e. via g_voice_loop->defer).
+static void reload_voice_conf_and_apply() {
+    const bool prev_license_required = g_cfg.voice_license_required;
+    load_voice_conf(g_conf_path.c_str());
+    const bool now_license_required = g_cfg.voice_license_required;
+    if (prev_license_required == now_license_required)
+        return; // nothing session-visible to update
+
+    std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+    if (now_license_required) {
+        // Newly required — anyone without an active license should be told.
+        const std::string payload = json{{"type","license_required"}}.dump();
+        const std::string ok      = json{{"type","license_granted"}}.dump();
+        const time_t now_t = time(nullptr);
+        for (auto& kv : g_by_char_id) {
+            ClientSession* s = kv.second;
+            if (!s || !s->authed || !s->ws || s->kicking) continue;
+            auto lit = g_voice_licenses.find(s->account_id);
+            const bool has = lit != g_voice_licenses.end() &&
+                             (lit->second == 0 || now_t < lit->second);
+            s->ws->send(has ? ok : payload, VoiceTcp::OpCode::TEXT);
+        }
+    } else {
+        // License mode disabled — anyone we had marked as no_license should be cleared.
+        const std::string payload = json{{"type","license_granted"}}.dump();
+        for (auto& kv : g_by_char_id) {
+            ClientSession* s = kv.second;
+            if (!s || !s->authed || !s->ws || s->kicking) continue;
+            s->ws->send(payload, VoiceTcp::OpCode::TEXT);
+        }
+    }
+    LOG_INFO("voice_license_required %s — notified active sessions",
+             now_license_required ? "ENABLED" : "DISABLED");
+}
+
 void request_server_stop() {
     g_server_stop_requested.store(true);
 
@@ -1185,7 +1310,7 @@ static void udp_position_loop() {
         if (g_reload_requested.load() && g_voice_loop.load()) {
             g_reload_requested.store(false);
             g_voice_loop.load()->defer([]() {
-                load_voice_conf(g_conf_path.c_str());
+                reload_voice_conf_and_apply();
                 reload_voice_db_config();
                 LOG_INFO("Voice config and DB reloaded from %s", g_conf_path.c_str());
             });
@@ -1225,6 +1350,9 @@ static void udp_position_loop() {
             // if the player disconnected between expiry and notify execution.
             std::vector<int> expired_admin_bans;
             std::vector<int> expired_notify_account_ids;
+            // Voice license expiries — same pattern as admin bans
+            std::vector<int> expired_licenses;
+            std::vector<int> expired_license_notify_account_ids;
 
             // 1. Pending position TTL — drop positions for players who never authed
             {
@@ -1286,6 +1414,22 @@ static void udp_position_loop() {
                             it = g_admin_banned.erase(it);
                         } else ++it;
                     }
+                    // Expire voice licenses
+                    for (auto it = g_voice_licenses.begin(); it != g_voice_licenses.end(); ) {
+                        if (it->second != 0 && now_t >= it->second) {
+                            const int aid = it->first;
+                            LOG_INFO("voice_license expired account_id=%d", aid);
+                            expired_licenses.push_back(aid);
+                            for (auto& kv : g_by_char_id) {
+                                ClientSession* s = kv.second;
+                                if (s && s->authed && s->account_id == aid) {
+                                    expired_license_notify_account_ids.push_back(aid);
+                                    break;
+                                }
+                            }
+                            it = g_voice_licenses.erase(it);
+                        } else ++it;
+                    }
                 }
 
                 // Kick provisional sessions whose advisory never arrived within
@@ -1312,6 +1456,26 @@ static void udp_position_loop() {
                     std::shared_lock<std::shared_mutex> lock(g_session_mtx);
                     const std::string payload =
                         json{{"type","admin_unbanned"}}.dump();
+                    for (int aid : aids) {
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(payload, VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            for (int aid : expired_licenses)
+                db_delete_license(aid);
+            if (!expired_license_notify_account_ids.empty() && g_voice_loop.load()
+                && g_cfg.voice_license_required) {
+                auto aids = std::move(expired_license_notify_account_ids);
+                g_voice_loop.load()->defer([aids = std::move(aids)]() {
+                    std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                    const std::string payload =
+                        json{{"type","license_required"}}.dump();
                     for (int aid : aids) {
                         for (auto& kv : g_by_char_id) {
                             ClientSession* s = kv.second;
@@ -1416,7 +1580,7 @@ static void udp_position_loop() {
 
         if (type == "reload_config") {
             g_voice_loop.load()->defer([]() {
-                load_voice_conf(g_conf_path.c_str());
+                reload_voice_conf_and_apply();
                 reload_voice_db_config();
                 LOG_INFO("Voice config and DB reloaded");
             });
@@ -1425,7 +1589,7 @@ static void udp_position_loop() {
 
         if (type == "reload_voice_conf") {
             g_voice_loop.load()->defer([]() {
-                load_voice_conf(g_conf_path.c_str());
+                reload_voice_conf_and_apply();
                 LOG_INFO("Voice config reloaded");
             });
             continue;
@@ -1615,6 +1779,75 @@ static void udp_position_loop() {
                     }
                     LOG_NOTICE("admin_unban_by_name '%s' account_id=%d", name.c_str(), aid);
                 }
+            }
+            continue;
+        }
+
+        if (type == "grant_license") {
+            int aid = j.value("account_id", 0);
+            int dur = j.value("duration", 0); // 0 = permanent
+            if (aid > 0) {
+                time_t until = (dur > 0) ? (time(nullptr) + dur) : 0;
+                bool has_session = false;
+                {
+                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    g_voice_licenses[aid] = until;
+                    for (auto& kv : g_by_char_id) {
+                        ClientSession* s = kv.second;
+                        if (s && s->authed && s->account_id == aid) {
+                            has_session = true; break;
+                        }
+                    }
+                }
+                db_insert_license(aid, j.value("granted_by", "item"), until);
+                if (has_session && g_voice_loop.load()) {
+                    g_voice_loop.load()->defer([aid]() {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(json{{"type","license_granted"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
+                    });
+                }
+                if (dur > 0)
+                    LOG_NOTICE("grant_license account_id=%d duration=%ds", aid, dur);
+                else
+                    LOG_NOTICE("grant_license account_id=%d permanent", aid);
+            }
+            continue;
+        }
+
+        if (type == "revoke_license") {
+            int aid = j.value("account_id", 0);
+            if (aid > 0) {
+                bool has_session = false;
+                {
+                    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                    g_voice_licenses.erase(aid);
+                    for (auto& kv : g_by_char_id) {
+                        ClientSession* s = kv.second;
+                        if (s && s->authed && s->account_id == aid) {
+                            has_session = true; break;
+                        }
+                    }
+                }
+                db_delete_license(aid);
+                if (has_session && g_voice_loop.load() && g_cfg.voice_license_required) {
+                    g_voice_loop.load()->defer([aid]() {
+                        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+                        for (auto& kv : g_by_char_id) {
+                            ClientSession* s = kv.second;
+                            if (s && s->authed && s->account_id == aid && s->ws && !s->kicking) {
+                                s->ws->send(json{{"type","license_required"}}.dump(), VoiceTcp::OpCode::TEXT);
+                                break;
+                            }
+                        }
+                    });
+                }
+                LOG_NOTICE("revoke_license account_id=%d", aid);
             }
             continue;
         }
@@ -2137,6 +2370,8 @@ void run_server() {
     } else {
         db_ensure_ban_table();
         db_load_bans(g_admin_banned);
+        db_ensure_license_table();
+        db_load_licenses(g_voice_licenses);
     }
 
     // Capture the server loop before any clients connect so Ctrl+C/SIGTERM can
@@ -2397,7 +2632,8 @@ void run_server() {
                                s->char_name.c_str(), s->ip.c_str(),
                                s->party_id, s->guild_id, online_snapshot);
                     send_json(ws, json{{"type", "auth_ok"}});
-                    // Notify DLL if this account is currently voice-banned
+                    // Notify DLL if this account is currently voice-banned,
+                    // and (if license mode is on) whether they hold a license.
                     {
                         std::shared_lock<std::shared_mutex> lock(g_session_mtx);
                         auto bit = g_admin_banned.find(s->account_id);
@@ -2405,6 +2641,13 @@ void run_server() {
                             const time_t now = time(nullptr);
                             if (bit->second == 0 || now < bit->second)
                                 send_json(ws, json{{"type", "admin_banned"}});
+                        }
+                        if (g_cfg.voice_license_required) {
+                            auto lit = g_voice_licenses.find(s->account_id);
+                            const bool has = lit != g_voice_licenses.end() &&
+                                             (lit->second == 0 || time(nullptr) < lit->second);
+                            if (!has)
+                                send_json(ws, json{{"type", "license_required"}});
                         }
                     }
                     send_json(ws, make_war_state_json(*s));

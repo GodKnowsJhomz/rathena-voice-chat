@@ -19,3 +19,5 @@ void voice_bridge_send_admin_ban(int account_id, int duration_sec); // 0 = perma
 void voice_bridge_send_admin_unban(int account_id);
 void voice_bridge_send_admin_ban_by_name(const char* char_name, int duration_sec);
 void voice_bridge_send_admin_unban_by_name(const char* char_name);
+void voice_bridge_send_grant_license(int account_id, int duration_sec); // 0 = permanent
+void voice_bridge_send_revoke_license(int account_id);

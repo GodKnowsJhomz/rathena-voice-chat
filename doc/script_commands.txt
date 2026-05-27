@@ -11799,3 +11799,39 @@ Set position for NPC dialog in pixels.
 Set position for NPC dialog in screen size percent.
 
 ---------------------------------------
+
+*voicegrant(<duration_sec>)
+
+Grant a voice chat license to the attached player's account.
+The voice server stores the grant in the voice_licenses table.
+Pass 0 for a permanent license; any positive integer is seconds
+until expiry.
+
+Only meaningful when conf/voice_athena.conf has
+'voice_license_required: 1'. With license mode off, the call still
+records the row in the DB but has no gameplay effect.
+
+Example:
+    voicegrant(0);            // permanent
+    voicegrant(2592000);      // 30 days
+    voicegrant(604800);       // 7 days
+
+Typical usage is from a consumable item's Script: field.
+
+See doc/voice_chat.txt for the full voice chat reference.
+
+---------------------------------------
+
+*voicerevoke {<account_id>}
+
+Revoke an existing voice license.
+With no argument acts on the attached player. With an account_id
+it can be called from any script context (NPC, console, etc).
+Deletes the row from voice_licenses and notifies the player's DLL
+in real time if they are online and license mode is enabled.
+
+Example:
+    voicerevoke;              // revoke from the attached player
+    voicerevoke 2000001;      // revoke from a specific account
+
+---------------------------------------

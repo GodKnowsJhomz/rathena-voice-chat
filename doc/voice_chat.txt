@@ -1,0 +1,203 @@
+//===== rAthena Documentation ================================
+//= Voice Chat System
+//===== Description: =========================================
+//= Proximity voice chat — server, client DLL, item license,
+//= GM moderation commands.
+//============================================================
+
+
+===========================
+| 1. Overview              |
+===========================
+
+The voice chat system is composed of three cooperating parts:
+
+  Map server  (rAthena)        — emits player/position events via UDP
+       ↓
+  Voice server (standalone)    — relays Opus audio between connected DLL clients
+       ↑
+  Voice client DLL (in-game)   — captures mic, plays back received audio
+
+
+  Map  ──UDP voice_bridge──▶  Voice server  ◀──WebSocket──▶  Client DLL
+
+
+===========================
+| 2. Files                 |
+===========================
+
+- src/voice/server.cpp ......... Voice server (audio relay, ban/license logic).
+- src/map/voice_bridge.{cpp,hpp} UDP sender used by map server to talk to the
+                                 voice server (join/leave/pos/admin commands).
+- voice-chat-client/src/* ...... Client DLL (capture, playback, overlay).
+- conf/voice_athena.conf ....... Voice server runtime config.
+- sql-files/voice_bans.sql ..... Persistent ban table.
+- sql-files/voice_licenses.sql . Persistent license table (only used when
+                                 voice_license_required is on).
+
+
+===========================
+| 3. GM Atcommands         |
+===========================
+
+@voicemute <player> [+time]
+@voiceunmute <player>
+
+  In-memory mute by char_id. The player can connect and hear others, but
+  their audio is dropped server-side. Mutes are NOT persisted — they clear
+  on voice server restart.
+
+  Examples:
+    @voicemute Albert            -> permanent mute
+    @voicemute Albert +30n       -> 30 minute mute
+    @voiceunmute Albert
+
+@voiceban <player> [+time]
+@voiceunban <player>
+
+  Persistent ban keyed on account_id (a player cannot bypass by switching
+  characters). Stored in the voice_bans table. Player stays connected and
+  can hear, but audio TX is blocked silently. Supports offline players via
+  char-name lookup.
+
+  Examples:
+    @voiceban Albert             -> permanent ban
+    @voiceban Albert +7d         -> 7 day ban
+    @voiceban OfflinePlayer +1d  -> works even if player is offline
+    @voiceunban Albert
+
+@voicegrant <player> [+time]
+@voicerevoke <player>
+
+  Grant or revoke a voice license. Only meaningful when the
+  voice_license_required config is enabled (see Section 5). Stored in
+  voice_licenses table — keyed on account_id, one license covers all
+  characters on that account.
+
+  Examples:
+    @voicegrant Albert           -> permanent license (free for life)
+    @voicegrant Albert +30d      -> 30 day license
+    @voicerevoke Albert          -> remove the license
+
+@reloadvoiceconf
+@reloadvoicedb
+
+  Reload conf/voice_athena.conf or the voice-related DB rules without
+  restarting the voice server. License-required toggle takes effect on
+  every active session immediately (no relog required).
+
+Time format
+-----------
+The [+time] argument uses rAthena's solve_time() syntax:
+    y/a = year   m = month   d/j = day   h = hour   n/mn = minute   s = second
+    +1h    1 hour
+    +30n   30 minutes
+    +7d    7 days
+    +1m    1 month
+
+
+===========================
+| 4. Script Commands       |
+===========================
+
+voicegrant(<duration_sec>);
+voicerevoke {<account_id>};
+
+  Used inside item or NPC scripts. Sends a UDP command to the voice
+  server. The duration is in seconds; 0 means permanent.
+
+  Example item entry (db/import/item_db.yml):
+
+    - Id: 31000
+      AegisName: Voice_Mobile_Perm
+      Name: Voice Mobile (Permanent)
+      Type: Usable
+      Buy: 1000000
+      Script: |
+        voicegrant(0);
+
+    - Id: 31001
+      AegisName: Voice_Mobile_30D
+      Name: Voice Mobile (30 Days)
+      Type: Usable
+      Buy: 200000
+      Script: |
+        voicegrant(2592000);    // 30 * 24 * 3600
+
+  voicerevoke without an argument acts on the attached player; with an
+  account_id it can be used from a non-player script context.
+
+
+===========================
+| 5. License Mode          |
+===========================
+
+The license feature is OFF by default. To enable it, edit
+conf/voice_athena.conf:
+
+    // 0 = anyone can use voice
+    // 1 = require an active voice_licenses entry
+    voice_license_required: 1
+
+Then in-game:
+
+    @reloadvoiceconf
+
+When the flag flips from 0 to 1, the voice server walks every active
+session and notifies the DLL:
+  - players with an active license     -> license_granted    (mic stays on)
+  - players without an active license  -> license_required   (mic shown off)
+
+When the flag flips from 1 to 0, every active session receives
+license_granted (mic re-enabled) — no relog required.
+
+Persistence
+-----------
+voice_licenses rows are stored with an optional expires_at column.
+NULL = permanent. The voice server's maintenance loop expires timed
+licenses every 10 seconds and pushes a license_required event to the
+affected player so the overlay updates immediately.
+
+
+===========================
+| 6. Bans                  |
+===========================
+
+voice_bans rows are stored with an optional banned_until column.
+NULL = permanent. Same maintenance loop expires timed bans and pushes
+admin_unbanned to the affected player so the mic icon clears
+without needing a relog.
+
+A banned player can still connect and HEAR everyone — only their
+outgoing audio is silenced (the mic icon in their overlay shows OFF).
+This is intentional: it avoids "why am I being disconnected?" support
+tickets while still preventing voice-grief.
+
+
+===========================
+| 7. Flood Protection      |
+===========================
+
+The voice server tracks per-session audio rate. If a client sends
+~30 consecutive rate-limited frames within 1 second, the server bans
+the ACCOUNT (not the IP) for 5 minutes and tells the DLL via a
+flood_banned message containing the remaining duration. The DLL's
+reconnect loop then waits out the ban before trying again, so a
+flood-banned client does not spam reconnects.
+
+IP is intentionally NOT used as the ban key — families on the same
+NAT would otherwise be collaterally punished.
+
+
+===========================
+| 8. SQL Setup             |
+===========================
+
+Run these once when first deploying the voice server (or just let the
+voice server auto-create them on first start):
+
+    sql-files/voice_bans.sql
+    sql-files/voice_licenses.sql
+
+Both tables are auto-created via CREATE TABLE IF NOT EXISTS at voice
+server startup, so importing the SQL files is optional.

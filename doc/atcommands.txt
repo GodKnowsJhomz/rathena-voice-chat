@@ -1428,6 +1428,38 @@ Example:
 
 ---------------------------------------
 
+@voicemute <player> [+time]
+@voiceunmute <player>
+@voiceban <player> [+time]
+@voiceunban <player>
+@voicegrant <player> [+time]
+@voicerevoke <player>
+@reloadvoiceconf
+@reloadvoicedb
+
+Voice chat moderation and license management. See doc/voice_chat.txt
+for the full reference.
+
+  voicemute / voiceunmute  In-memory mute by char_id (not persisted).
+  voiceban / voiceunban    Persistent ban by account_id (voice_bans table).
+                           Banned player can still hear, but mic is silenced.
+                           Supports offline players via char-name lookup.
+  voicegrant / voicerevoke Voice license (only when voice_license_required
+                           is enabled). Stored in voice_licenses table,
+                           keyed on account_id.
+  reloadvoiceconf          Reload conf/voice_athena.conf. License-mode
+                           changes take effect on every session immediately.
+  reloadvoicedb            Reload voice DB rules (blocked maps, etc).
+
+Time argument uses solve_time() syntax: +1h, +30n, +7d, +1m ...
+Empty time = permanent.
+
+Example:
+@voiceban Albert +7d        -> 7 day voice ban
+@voicegrant Albert +30d     -> 30 day voice license
+
+---------------------------------------
+
 @block <player name>
 @unblock <player name>
 

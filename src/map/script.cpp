@@ -62,6 +62,7 @@
 #include "pet.hpp"
 #include "quest.hpp"
 #include "storage.hpp"
+#include "voice_bridge.hpp"
 
 using namespace rathena;
 
@@ -27877,6 +27878,42 @@ BUILDIN_FUNC(mesemotion){
 
 #include <custom/script.inc>
 
+/**
+ * Grant a voice license to the attached player's account.
+ *   voicegrant(<duration_sec>);    // 0 = permanent
+ * Sent to the voice server via UDP voice_bridge; the server stores it
+ * in `voice_licenses` and notifies the DLL.
+ */
+BUILDIN_FUNC(voicegrant) {
+	map_session_data* sd = nullptr;
+	if (!script_rid2sd(sd))
+		return SCRIPT_CMD_FAILURE;
+	int duration = script_getnum(st, 2);
+	if (duration < 0) duration = 0;
+	voice_bridge_send_grant_license(sd->status.account_id, duration);
+	return SCRIPT_CMD_SUCCESS;
+}
+
+/**
+ * Revoke voice license from the attached player (or by account_id when given).
+ *   voicerevoke;            // attached player
+ *   voicerevoke <aid>;      // explicit account_id
+ */
+BUILDIN_FUNC(voicerevoke) {
+	int aid = 0;
+	if (script_hasdata(st, 2)) {
+		aid = script_getnum(st, 2);
+	} else {
+		map_session_data* sd = nullptr;
+		if (!script_rid2sd(sd))
+			return SCRIPT_CMD_FAILURE;
+		aid = sd->status.account_id;
+	}
+	if (aid <= 0) return SCRIPT_CMD_FAILURE;
+	voice_bridge_send_revoke_license(aid);
+	return SCRIPT_CMD_SUCCESS;
+}
+
 // declarations that were supposed to be exported from npc_chat.cpp
 #ifdef PCRE_SUPPORT
 BUILDIN_FUNC(defpattern);
@@ -28653,6 +28690,9 @@ struct script_function buildin_func[] = {
 	BUILDIN_DEF( mesitemicon, "v??" ),
 	BUILDIN_DEF(meshyperlink, "ss"),
 	BUILDIN_DEF(mesemotion,"i"),
+
+	BUILDIN_DEF(voicegrant,"i"),
+	BUILDIN_DEF(voicerevoke,"?"),
 
 #include <custom/script_def.inc>
 

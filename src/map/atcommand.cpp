@@ -4540,6 +4540,49 @@ ACMD_FUNC(voiceunban) {
 	return 0;
 }
 
+ACMD_FUNC(voicegrant) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	char time_str[64] = {};
+	if (!message || !*message || sscanf(message, "%23s %63[^\n]", player_name, time_str) < 1) {
+		clif_displaymessage(fd, "Usage: @voicegrant <player> [+time]  e.g. +30d  (empty = permanent)");
+		return -1;
+	}
+	int duration_sec = voice_parse_duration(time_str);
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (!pl_sd) {
+		clif_displaymessage(fd, msg_txt(sd, 3));
+		return -1;
+	}
+	voice_bridge_send_grant_license(pl_sd->status.account_id, duration_sec);
+	char output[128];
+	if (duration_sec > 0)
+		snprintf(output, sizeof(output), "Voice license granted to '%s' for %ds.", pl_sd->status.name, duration_sec);
+	else
+		snprintf(output, sizeof(output), "Voice license granted to '%s' permanently.", pl_sd->status.name);
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
+ACMD_FUNC(voicerevoke) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	if (!message || !*message || sscanf(message, "%23[^\n]", player_name) < 1) {
+		clif_displaymessage(fd, "Usage: @voicerevoke <player>");
+		return -1;
+	}
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (!pl_sd) {
+		clif_displaymessage(fd, msg_txt(sd, 3));
+		return -1;
+	}
+	voice_bridge_send_revoke_license(pl_sd->status.account_id);
+	char output[128];
+	snprintf(output, sizeof(output), "Voice license revoked from '%s'.", pl_sd->status.name);
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
 ACMD_FUNC(reloadbattleconf){
 	nullpo_retr(-1, sd);
 
@@ -11914,6 +11957,8 @@ void atcommand_basecommands(void) {
 		ACMD_DEF(voiceunmute),
 		ACMD_DEF(voiceban),
 		ACMD_DEF(voiceunban),
+		ACMD_DEF(voicegrant),
+		ACMD_DEF(voicerevoke),
 	};
 	AtCommandInfo* atcommand;
 	int32 i;
