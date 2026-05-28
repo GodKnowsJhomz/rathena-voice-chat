@@ -58,6 +58,7 @@
 #include "storage.hpp"
 #include "unit.hpp"
 #include "vending.hpp"
+#include "voice_bridge.hpp"
 
 using namespace rathena;
 
@@ -15161,6 +15162,10 @@ void clif_parse_PMIgnore(int32 fd, map_session_data* sd)
 
 		//Insert in position i
 		safestrncpy(sd->ignore[i].name, nick, NAME_LENGTH);
+
+		// Voice ignore-sync: also block this player's voice (honored only when
+		// the voice server has voice_ignore_sync enabled).
+		voice_bridge_send_block_by_name(sd->status.account_id, nick);
 	} else { // Remove name from ignore list (unblock)
 
 		// find entry
@@ -15173,6 +15178,9 @@ void clif_parse_PMIgnore(int32 fd, map_session_data* sd)
 		memmove(sd->ignore[i].name, sd->ignore[i+1].name, (MAX_IGNORE_LIST-i-1)*sizeof(sd->ignore[0].name));
 		// wipe last entry
 		memset(sd->ignore[MAX_IGNORE_LIST-1].name, 0, sizeof(sd->ignore[0].name));
+
+		// Voice ignore-sync: also remove the voice block.
+		voice_bridge_send_unblock_by_name(sd->status.account_id, nick);
 	}
 
 	clif_wisexin( *sd, type, 0 ); // success

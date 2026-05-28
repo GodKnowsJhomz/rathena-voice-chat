@@ -217,6 +217,14 @@ namespace {
 		return 0;
 	}
 
+	// Broadcast a one-line alert to every online GM that can receive requests.
+	int voice_alert_gm_sub(map_session_data* sd, va_list ap) {
+		const char* msg = va_arg(ap, const char*);
+		if (sd && pc_has_permission(sd, PC_PERM_RECEIVE_REQUESTS))
+			clif_displaymessage(sd->fd, msg);
+		return 0;
+	}
+
 	void voice_bridge_poll_replies() {
 		if (!g_ready || g_sock == INVALID_SOCK)
 			return;
@@ -240,13 +248,22 @@ namespace {
 			const std::string payload(buf, n);
 			if (!g_bridge_secret.empty() && json_string_field(payload, "bridge_secret") != g_bridge_secret)
 				continue;
-			if (json_string_field(payload, "type") != "speaking_hat")
-				continue;
 
-			voice_set_speaking_hat(
-				json_int_field(payload, "char_id"),
-				json_bool_field(payload, "speaking")
-			);
+			const std::string rtype = json_string_field(payload, "type");
+			if (rtype == "speaking_hat") {
+				voice_set_speaking_hat(
+					json_int_field(payload, "char_id"),
+					json_bool_field(payload, "speaking")
+				);
+			} else if (rtype == "block_alert") {
+				const std::string name = json_string_field(payload, "name");
+				const int count = json_int_field(payload, "count");
+				char msg[192];
+				std::snprintf(msg, sizeof(msg),
+					"[Voice] '%s' has been voice-blocked by %d players (possible toxic player).",
+					name.c_str(), count);
+				map_foreachpc(voice_alert_gm_sub, msg);
+			}
 		}
 	}
 
@@ -543,6 +560,24 @@ bool voice_bridge_send_revoke_license(int account_id) {
 		"{\"type\":\"revoke_license\",\"account_id\":%d}", account_id);
 	voice_bridge_send_text(buf);
 	return true;
+}
+
+void voice_bridge_send_block_by_name(int blocker_account_id, const char* blocked_name) {
+	if (!g_ready || blocker_account_id <= 0 || !blocked_name || !blocked_name[0]) return;
+	char buf[160];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"block_by_name\",\"blocker_account_id\":%d,\"name\":\"%s\"}",
+		blocker_account_id, blocked_name);
+	voice_bridge_send_text(buf);
+}
+
+void voice_bridge_send_unblock_by_name(int blocker_account_id, const char* blocked_name) {
+	if (!g_ready || blocker_account_id <= 0 || !blocked_name || !blocked_name[0]) return;
+	char buf[160];
+	std::snprintf(buf, sizeof(buf),
+		"{\"type\":\"unblock_by_name\",\"blocker_account_id\":%d,\"name\":\"%s\"}",
+		blocker_account_id, blocked_name);
+	voice_bridge_send_text(buf);
 }
 
 void voice_bridge_send_leave(map_session_data* sd) {

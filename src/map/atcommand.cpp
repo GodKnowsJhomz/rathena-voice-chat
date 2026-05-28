@@ -4589,6 +4589,81 @@ ACMD_FUNC(voicerevoke) {
 	return 0;
 }
 
+// @voiceblockers <player> — how many distinct players have voice-blocked
+// the target (toxic-player detector). Reads the voice_blocks table directly.
+ACMD_FUNC(voiceblockers) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	if (!message || !*message || sscanf(message, "%23[^\n]", player_name) < 1) {
+		clif_displaymessage(fd, "Usage: @voiceblockers <player>");
+		return -1;
+	}
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	int rc;
+	if (pl_sd) {
+		rc = Sql_Query(mmysql_handle,
+			"SELECT COUNT(*) FROM `voice_blocks` WHERE `blocked_account_id`=%d",
+			pl_sd->status.account_id);
+	} else {
+		char esc[NAME_LENGTH * 2 + 1];
+		Sql_EscapeString(mmysql_handle, esc, player_name);
+		rc = Sql_Query(mmysql_handle,
+			"SELECT COUNT(*) FROM `voice_blocks` WHERE `blocked_name`='%s'", esc);
+	}
+	if (rc == SQL_ERROR) {
+		clif_displaymessage(fd, "Voice block table unavailable (voice server not initialised?).");
+		return -1;
+	}
+	int count = 0;
+	if (Sql_NextRow(mmysql_handle) == SQL_SUCCESS) {
+		char* data; Sql_GetData(mmysql_handle, 0, &data, nullptr);
+		count = data ? atoi(data) : 0;
+	}
+	Sql_FreeResult(mmysql_handle);
+	char output[160];
+	snprintf(output, sizeof(output), "'%s' has been voice-blocked by %d player(s).", player_name, count);
+	clif_displaymessage(fd, output);
+	return 0;
+}
+
+// @voiceblocks <player> — list who the target has voice-blocked (online only,
+// since resolving an offline player's account_id needs a char-server lookup).
+ACMD_FUNC(voiceblocks) {
+	nullpo_retr(-1, sd);
+	char player_name[NAME_LENGTH];
+	if (!message || !*message || sscanf(message, "%23[^\n]", player_name) < 1) {
+		clif_displaymessage(fd, "Usage: @voiceblocks <player>  (player must be online)");
+		return -1;
+	}
+	map_session_data* pl_sd = map_nick2sd(player_name, true);
+	if (!pl_sd) {
+		clif_displaymessage(fd, msg_txt(sd, 3));
+		return -1;
+	}
+	if (Sql_Query(mmysql_handle,
+			"SELECT `blocked_name` FROM `voice_blocks` WHERE `blocker_account_id`=%d ORDER BY `created_at`",
+			pl_sd->status.account_id) == SQL_ERROR) {
+		clif_displaymessage(fd, "Voice block table unavailable (voice server not initialised?).");
+		return -1;
+	}
+	char output[160];
+	snprintf(output, sizeof(output), "'%s' has voice-blocked %llu player(s):",
+		pl_sd->status.name, (unsigned long long)Sql_NumRows(mmysql_handle));
+	clif_displaymessage(fd, output);
+	int shown = 0;
+	while (Sql_NextRow(mmysql_handle) == SQL_SUCCESS) {
+		char* data; Sql_GetData(mmysql_handle, 0, &data, nullptr);
+		snprintf(output, sizeof(output), "  - %s", data ? data : "(unknown)");
+		clif_displaymessage(fd, output);
+		if (++shown >= 50) {  // cap output flood
+			clif_displaymessage(fd, "  ... (list truncated at 50)");
+			break;
+		}
+	}
+	Sql_FreeResult(mmysql_handle);
+	return 0;
+}
+
 ACMD_FUNC(reloadbattleconf){
 	nullpo_retr(-1, sd);
 
@@ -11965,6 +12040,8 @@ void atcommand_basecommands(void) {
 		ACMD_DEF(voiceunban),
 		ACMD_DEF(voicegrant),
 		ACMD_DEF(voicerevoke),
+		ACMD_DEF(voiceblockers),
+		ACMD_DEF(voiceblocks),
 	};
 	AtCommandInfo* atcommand;
 	int32 i;

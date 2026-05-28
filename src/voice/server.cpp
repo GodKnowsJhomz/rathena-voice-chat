@@ -60,6 +60,9 @@ struct SrvConfig {
     bool        war_mode_enabled     = true;
     bool        war_allow_whisper    = true;
     bool        voice_license_required = false; // gate audio TX behind a voice_licenses entry
+    bool        voice_block_bidirectional = false; // A blocks B → neither hears the other
+    int         voice_block_alert_threshold = 0;   // distinct blockers to alert GMs (0 = off)
+    bool        voice_ignore_sync = false;          // text /ex ignore also blocks voice
 
     std::string db_host       = "127.0.0.1";
     int         db_port       = 3306;
@@ -172,6 +175,15 @@ static void load_voice_conf(const char* path) {
         else if (key == "voice_license_required") {
             if (!val.empty()) g_cfg.voice_license_required = (std::stoi(val) != 0); return true;
         }
+        else if (key == "voice_block_bidirectional") {
+            if (!val.empty()) g_cfg.voice_block_bidirectional = (std::stoi(val) != 0); return true;
+        }
+        else if (key == "voice_block_alert_threshold") {
+            if (!val.empty()) g_cfg.voice_block_alert_threshold = std::stoi(val); return true;
+        }
+        else if (key == "voice_ignore_sync") {
+            if (!val.empty()) g_cfg.voice_ignore_sync = (std::stoi(val) != 0); return true;
+        }
         else if (key == "voice_client_secret") {
             g_cfg.client_secret = val; return true;
         }
@@ -278,9 +290,10 @@ static bool db_connect() {
 
 struct CharInfo {
     std::string char_name;
-    int party_id = 0;
-    int guild_id = 0;
-    bool ok      = false;
+    int party_id   = 0;
+    int guild_id   = 0;
+    int account_id = 0;
+    bool ok        = false;
 };
 
 static CharInfo db_get_char_info(int char_id) {
@@ -292,7 +305,7 @@ static CharInfo db_get_char_info(int char_id) {
         if (!db_connect()) return {};
     }
 
-    std::string query = "SELECT `name`,`party_id`,`guild_id` FROM `"
+    std::string query = "SELECT `name`,`party_id`,`guild_id`,`account_id` FROM `"
                       + g_cfg.db_char_table
                       + "` WHERE `char_id`=" + std::to_string(char_id) + " LIMIT 1";
 
@@ -308,10 +321,11 @@ static CharInfo db_get_char_info(int char_id) {
     CharInfo info;
     MYSQL_ROW row = mysql_fetch_row(res);
     if (row) {
-        info.char_name = row[0] ? row[0] : "";
-        info.party_id  = row[1] ? std::atoi(row[1]) : 0;
-        info.guild_id  = row[2] ? std::atoi(row[2]) : 0;
-        info.ok        = true;
+        info.char_name  = row[0] ? row[0] : "";
+        info.party_id   = row[1] ? std::atoi(row[1]) : 0;
+        info.guild_id   = row[2] ? std::atoi(row[2]) : 0;
+        info.account_id = row[3] ? std::atoi(row[3]) : 0;
+        info.ok         = true;
     }
     mysql_free_result(res);
     return info;
@@ -537,6 +551,72 @@ static void db_delete_license(int account_id) {
         LOG_ERROR("db_delete_license: %s", mysql_error(g_db));
 }
 
+// ── Voice block DB (player-driven block list) ────────────────────────────────
+static void db_ensure_block_table() {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql =
+        "CREATE TABLE IF NOT EXISTS `voice_blocks` ("
+        "  `blocker_account_id` INT NOT NULL,"
+        "  `blocked_account_id` INT NOT NULL,"
+        "  `blocked_name`       VARCHAR(24) NOT NULL DEFAULT '',"
+        "  `created_at`         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (`blocker_account_id`, `blocked_account_id`),"
+        "  INDEX (`blocker_account_id`)"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    if (mysql_query(g_db, sql) != 0)
+        LOG_ERROR("db_ensure_block_table: %s", mysql_error(g_db));
+}
+
+static void db_load_blocks(std::unordered_map<int, std::unordered_set<int>>& out) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    const char* sql = "SELECT `blocker_account_id`, `blocked_account_id` FROM `voice_blocks`";
+    if (mysql_query(g_db, sql) != 0) {
+        LOG_ERROR("db_load_blocks: %s", mysql_error(g_db));
+        return;
+    }
+    MYSQL_RES* res = mysql_store_result(g_db);
+    if (!res) return;
+    size_t total = 0;
+    MYSQL_ROW row;
+    while ((row = mysql_fetch_row(res))) {
+        if (!row[0] || !row[1]) continue;
+        int blocker = std::atoi(row[0]);
+        int blocked = std::atoi(row[1]);
+        if (blocker > 0 && blocked > 0) {
+            out[blocker].insert(blocked);
+            ++total;
+        }
+    }
+    mysql_free_result(res);
+    LOG_INFO("voice_blocks loaded %zu entry(ies) across %zu blocker(s)", total, out.size());
+}
+
+static void db_insert_block(int blocker_aid, int blocked_aid, const std::string& blocked_name) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    char name_esc[100] = {};
+    mysql_real_escape_string(g_db, name_esc, blocked_name.c_str(),
+                             (unsigned long)std::min(blocked_name.size(), sizeof(name_esc) / 2 - 1));
+    std::string sql =
+        "INSERT INTO `voice_blocks` (`blocker_account_id`,`blocked_account_id`,`blocked_name`) VALUES ("
+        + std::to_string(blocker_aid) + "," + std::to_string(blocked_aid) + ",'" + name_esc + "') "
+        "ON DUPLICATE KEY UPDATE `blocked_name`='" + name_esc + "'";
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_insert_block: %s", mysql_error(g_db));
+}
+
+static void db_delete_block(int blocker_aid, int blocked_aid) {
+    std::lock_guard<std::mutex> lock(g_db_mtx);
+    if (!g_db) return;
+    std::string sql = "DELETE FROM `voice_blocks` WHERE `blocker_account_id`="
+        + std::to_string(blocker_aid)
+        + " AND `blocked_account_id`=" + std::to_string(blocked_aid);
+    if (mysql_query(g_db, sql.c_str()) != 0)
+        LOG_ERROR("db_delete_block: %s", mysql_error(g_db));
+}
+
 // Same as db_delete_license but only matches expired rows. Used by the
 // maintenance sweep so a race-condition re-grant that lands between the
 // in-memory erase and this DELETE does not nuke a freshly-issued license.
@@ -719,6 +799,14 @@ static std::unordered_map<int, time_t> g_admin_banned; // persisted in voice_ban
 // ── Voice license (account_id → expires time_t, 0 = permanent)
 // Only enforced when g_cfg.voice_license_required is true.
 static std::unordered_map<int, time_t> g_voice_licenses; // persisted in voice_licenses table
+
+// ── Voice block list (blocker_account_id → set of blocked account_ids)
+// Player-driven asymmetric block: blocker doesn't hear blocked.
+// Stored in voice_blocks DB table.
+static std::unordered_map<int, std::unordered_set<int>> g_voice_blocks;
+// Accounts we've already raised a toxic-player alert for (avoid re-alerting
+// on every subsequent block once the threshold is crossed). Cleared on restart.
+static std::unordered_set<int> g_block_alerted;
 
 // ── Pre-built lookup indexes (maintained under g_session_mtx) ────────────────
 // Replaces O(n) full-scan with O(members_in_channel) per audio packet.
@@ -987,6 +1075,19 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
         if (!has_license) return false;
     }
 
+    // Receiver-side personal block list — drop if `to` blocked `from`'s account
+    if (to.account_id > 0 && from.account_id > 0) {
+        auto bit = g_voice_blocks.find(to.account_id);
+        if (bit != g_voice_blocks.end() && bit->second.count(from.account_id))
+            return false;
+        // Bidirectional: also drop if `from` blocked `to` (so neither hears the other)
+        if (g_cfg.voice_block_bidirectional) {
+            auto fit = g_voice_blocks.find(from.account_id);
+            if (fit != g_voice_blocks.end() && fit->second.count(to.account_id))
+                return false;
+        }
+    }
+
     // GM-muted sender — no one hears them
     {
         auto mit = g_admin_muted.find(from.char_id);
@@ -1219,6 +1320,29 @@ static void send_map_speaking_hat(int char_id, bool speaking) {
         payload += ",\"bridge_secret\":\"" + json_escape_copy(g_cfg.voice_bridge_secret) + "\"";
     payload += "}";
 
+    sendto(g_udp_sock, payload.c_str(), static_cast<int>(payload.size()), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+// Notify the map server that a player has been blocked by many distinct
+// accounts (possible toxic player). Map server broadcasts to online GMs.
+static void send_map_block_alert(int blocked_char_id, const std::string& blocked_name, int count) {
+    if (g_udp_sock == INVALID_SOCKET)
+        return;
+    sockaddr_in to{};
+    {
+        std::lock_guard<std::mutex> lock(g_map_bridge_addr_mtx);
+        if (!g_map_bridge_addr_valid)
+            return;
+        to = g_map_bridge_addr;
+    }
+    std::string payload = std::string("{\"type\":\"block_alert\",\"char_id\":")
+        + std::to_string(blocked_char_id)
+        + ",\"name\":\"" + json_escape_copy(blocked_name) + "\""
+        + ",\"count\":" + std::to_string(count);
+    if (!g_cfg.voice_bridge_secret.empty())
+        payload += ",\"bridge_secret\":\"" + json_escape_copy(g_cfg.voice_bridge_secret) + "\"";
+    payload += "}";
     sendto(g_udp_sock, payload.c_str(), static_cast<int>(payload.size()), 0,
            reinterpret_cast<const sockaddr*>(&to), sizeof(to));
 }
@@ -1898,6 +2022,47 @@ static void udp_position_loop() {
             continue;
         }
 
+        // ── Ignore-list sync (text /ex → voice block) ─────────────────────
+        // Sent by the map server when a player adds/removes a name from their
+        // text ignore list. Only honored when voice_ignore_sync is enabled.
+        if (type == "block_by_name") {
+            if (!g_cfg.voice_ignore_sync) continue;
+            int blocker_aid = j.value("blocker_account_id", 0);
+            std::string name = j.value("name", "");
+            if (blocker_aid <= 0 || name.empty()) continue;
+            int blocked_aid = db_lookup_account_id_by_name(name);
+            if (blocked_aid <= 0 || blocked_aid == blocker_aid) continue;
+            {
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                g_voice_blocks[blocker_aid].insert(blocked_aid);
+            }
+            db_insert_block(blocker_aid, blocked_aid, name);
+            LOG_INFO("ignore-sync block: aid=%d blocked aid=%d (%s)",
+                     blocker_aid, blocked_aid, name.c_str());
+            continue;
+        }
+
+        if (type == "unblock_by_name") {
+            if (!g_cfg.voice_ignore_sync) continue;
+            int blocker_aid = j.value("blocker_account_id", 0);
+            std::string name = j.value("name", "");
+            if (blocker_aid <= 0 || name.empty()) continue;
+            int blocked_aid = db_lookup_account_id_by_name(name);
+            if (blocked_aid <= 0) continue;
+            {
+                std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                auto bit = g_voice_blocks.find(blocker_aid);
+                if (bit != g_voice_blocks.end()) {
+                    bit->second.erase(blocked_aid);
+                    if (bit->second.empty()) g_voice_blocks.erase(bit);
+                }
+            }
+            db_delete_block(blocker_aid, blocked_aid);
+            LOG_INFO("ignore-sync unblock: aid=%d unblocked aid=%d (%s)",
+                     blocker_aid, blocked_aid, name.c_str());
+            continue;
+        }
+
         if (type == "auth_advisory") {
             // From Map Server — authoritative info on who is currently logged in.
             int cid = j.value("char_id",    0);
@@ -2416,9 +2581,11 @@ void run_server() {
     } else {
         db_ensure_ban_table();
         db_ensure_license_table();
+        db_ensure_block_table();
         db_purge_expired_rows();
         db_load_bans(g_admin_banned);
         db_load_licenses(g_voice_licenses);
+        db_load_blocks(g_voice_blocks);
     }
 
     // Capture the server loop before any clients connect so Ctrl+C/SIGTERM can
@@ -2696,6 +2863,24 @@ void run_server() {
                             if (!has)
                                 send_json(ws, json{{"type", "license_required"}});
                         }
+                        // Send the player's block list — char_ids currently online
+                        // for accounts on their block list (offline accounts can't
+                        // be heard anyway and don't need UI flagging).
+                        auto blk = g_voice_blocks.find(s->account_id);
+                        if (blk != g_voice_blocks.end() && !blk->second.empty()) {
+                            json arr = json::array();
+                            for (auto& kv : g_by_char_id) {
+                                ClientSession* o = kv.second;
+                                if (!o || !o->authed) continue;
+                                if (blk->second.count(o->account_id)) {
+                                    arr.push_back({
+                                        {"char_id", o->char_id},
+                                        {"name",    o->char_name}
+                                    });
+                                }
+                            }
+                            send_json(ws, json{{"type","your_blocks"},{"blocked", arr}});
+                        }
                     }
                     send_json(ws, make_war_state_json(*s));
                     // Push initial position so the DLL knows where the player is
@@ -2932,6 +3117,100 @@ void run_server() {
                         return;
                     }
                     s->ptt = j.value("value", false);
+                    return;
+                }
+
+                if (type == "block_add") {
+                    // Player wants to block another player's voice. The target
+                    // is identified by char_id; we resolve to account_id so the
+                    // block follows across char switches.
+                    // Online-only: avoids a DB query on the WS event loop, which a
+                    // modified client could otherwise spam with random char_ids to
+                    // stall the server. The block UI only ever shows online players.
+                    int target_cid = j.value("target_char_id", 0);
+                    if (target_cid <= 0 || target_cid == s->char_id) return;
+
+                    int target_aid = 0;
+                    std::string target_name;
+                    {
+                        std::shared_lock<std::shared_mutex> rl(g_session_mtx);
+                        auto it = g_by_char_id.find(target_cid);
+                        if (it != g_by_char_id.end() && it->second && it->second->authed) {
+                            target_aid  = it->second->account_id;
+                            target_name = it->second->char_name;
+                        }
+                    }
+                    if (target_aid <= 0 || target_aid == s->account_id) return;
+
+                    int distinct_blockers = 0;
+                    bool fire_alert = false;
+                    bool newly_blocked = false;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        // insert() returns false if already present — skip the DB
+                        // write and ack so a spam client can't hammer the DB.
+                        newly_blocked = g_voice_blocks[s->account_id].insert(target_aid).second;
+                        if (newly_blocked && g_cfg.voice_block_alert_threshold > 0 &&
+                            !g_block_alerted.count(target_aid)) {
+                            for (auto& kv : g_voice_blocks)
+                                if (kv.second.count(target_aid)) ++distinct_blockers;
+                            if (distinct_blockers >= g_cfg.voice_block_alert_threshold) {
+                                g_block_alerted.insert(target_aid);
+                                fire_alert = true;
+                            }
+                        }
+                    }
+                    if (!newly_blocked) return; // already blocked — nothing to do
+                    db_insert_block(s->account_id, target_aid, target_name);
+                    send_json(ws, json{
+                        {"type",         "block_added"},
+                        {"target_char_id", target_cid},
+                        {"target_name",   target_name}
+                    });
+                    LOG_INFO("block_add: aid=%d blocked aid=%d (%s)",
+                             s->account_id, target_aid, target_name.c_str());
+                    if (fire_alert) {
+                        LOG_WARNING("TOXIC ALERT: account_id=%d (%s) blocked by %d distinct players",
+                                    target_aid, target_name.c_str(), distinct_blockers);
+                        send_map_block_alert(target_cid, target_name, distinct_blockers);
+                    }
+                    return;
+                }
+
+                if (type == "block_remove") {
+                    // Online-only resolution (same DoS-avoidance rationale as block_add).
+                    // The block UI lists players that were online at block/auth time,
+                    // so an unblock target is normally still reachable. If they went
+                    // offline, the unblock can be retried once they are online again.
+                    int target_cid = j.value("target_char_id", 0);
+                    if (target_cid <= 0) return;
+
+                    int target_aid = 0;
+                    {
+                        std::shared_lock<std::shared_mutex> rl(g_session_mtx);
+                        auto it = g_by_char_id.find(target_cid);
+                        if (it != g_by_char_id.end() && it->second && it->second->authed)
+                            target_aid = it->second->account_id;
+                    }
+                    if (target_aid <= 0) return;
+
+                    bool was_blocked = false;
+                    {
+                        std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+                        auto bit = g_voice_blocks.find(s->account_id);
+                        if (bit != g_voice_blocks.end()) {
+                            was_blocked = bit->second.erase(target_aid) > 0;
+                            if (bit->second.empty()) g_voice_blocks.erase(bit);
+                        }
+                    }
+                    if (!was_blocked) return; // wasn't blocked — nothing to do
+                    db_delete_block(s->account_id, target_aid);
+                    send_json(ws, json{
+                        {"type",          "block_removed"},
+                        {"target_char_id", target_cid}
+                    });
+                    LOG_INFO("block_remove: aid=%d unblocked aid=%d",
+                             s->account_id, target_aid);
                     return;
                 }
 

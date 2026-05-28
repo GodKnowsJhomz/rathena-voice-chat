@@ -1434,6 +1434,8 @@ Example:
 @voiceunban <player>
 @voicegrant <player> [+time]
 @voicerevoke <player>
+@voiceblockers <player>
+@voiceblocks <player>
 @reloadvoiceconf
 @reloadvoicedb
 
@@ -1447,8 +1449,11 @@ for the full reference.
   voicegrant / voicerevoke Voice license (only when voice_license_required
                            is enabled). Stored in voice_licenses table,
                            keyed on account_id.
-  reloadvoiceconf          Reload conf/voice_athena.conf. License-mode
-                           changes take effect on every session immediately.
+  voiceblockers <player>   Count how many players have voice-blocked the
+                           target (toxic-player detector). Works offline.
+  voiceblocks <player>     List who the target has voice-blocked (online).
+  reloadvoiceconf          Reload conf/voice_athena.conf. License-mode and
+                           block-option changes take effect immediately.
   reloadvoicedb            Reload voice DB rules (blocked maps, etc).
 
 Time argument uses solve_time() syntax: +1h, +30n, +7d, +1m ...

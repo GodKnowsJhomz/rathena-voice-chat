@@ -31,9 +31,8 @@ The voice chat system is composed of three cooperating parts:
                                  voice server (join/leave/pos/admin commands).
 - voice-chat-client/src/* ...... Client DLL (capture, playback, overlay).
 - conf/voice_athena.conf ....... Voice server runtime config.
-- sql-files/voice_bans.sql ..... Persistent ban table.
-- sql-files/voice_licenses.sql . Persistent license table (only used when
-                                 voice_license_required is on).
+- sql-files/voice_chat.sql ..... voice_bans, voice_licenses, voice_blocks
+                                 tables (also auto-created at startup).
 
 
 ===========================
@@ -171,6 +170,63 @@ affected player so the overlay updates immediately.
 
 
 ===========================
+| 5b. Per-player Block     |
+===========================
+
+Players can block individual voices on their own — no GM action needed.
+This is the voice equivalent of an "ignore list":
+
+  - Asymmetric: the blocker stops hearing the blocked player. The blocked
+    player can still hear the blocker (and is not notified).
+  - Keyed on account_id so it follows the blocked player across character
+    switches: blocking "Albert" automatically silences "AlbertAlt" on the
+    same account.
+  - Persistent in the voice_blocks DB table — survives relog and reinstall
+    of the client DLL. Cross-device sync is automatic.
+  - Server-side filter in should_forward(): audio for a blocked sender is
+    never even forwarded to the blocker's DLL, saving bandwidth and making
+    the block impossible to bypass with a modified client.
+
+Client UX
+---------
+The overlay's player list provides a Mute / Unmute toggle which calls the
+DLL's mute_player(char_id) / unmute_player(char_id). Internally the DLL
+sends a block_add / block_remove WS message to the voice server and
+optimistically updates its local UI list. The server stores the block
+keyed on account_id and pushes the authoritative list back on every
+auth_ok via a your_blocks message.
+
+Limits
+------
+The block list only flags blocked players whose char_id is online at auth
+time. If the blocked account comes online later with a different character,
+the server still filters their audio correctly, but the overlay's
+"(Blocked)" indicator won't update until the blocker relogs.
+
+Block options (conf/voice_athena.conf)
+--------------------------------------
+  voice_block_bidirectional   1 = A blocks B → neither hears the other.
+                              0 = asymmetric (only the blocker is affected).
+  voice_block_alert_threshold N = alert online GMs when a player is blocked
+                              by N distinct accounts (toxic detector). 0 = off.
+  voice_ignore_sync           1 = a player's text /ex ignore also voice-blocks
+                              that player (and /in removes it). 0 = independent.
+
+GM block queries
+----------------
+  @voiceblockers <player>   How many players have voice-blocked <player>.
+                            Works offline (matches by stored name).
+  @voiceblocks <player>     List who <player> has blocked. Online only.
+
+Toxic alert
+-----------
+When voice_block_alert_threshold is set and a player crosses it, the voice
+server pushes a one-time block_alert to the map server, which broadcasts a
+line to every online GM that holds the receive-requests permission. The
+alert fires once per account per server uptime.
+
+
+===========================
 | 6. Bans                  |
 ===========================
 
@@ -204,11 +260,11 @@ NAT would otherwise be collaterally punished.
 | 8. SQL Setup             |
 ===========================
 
-Run these once when first deploying the voice server (or just let the
-voice server auto-create them on first start):
+Run this once when first deploying the voice server (or just let the
+voice server auto-create the tables on first start):
 
-    sql-files/voice_bans.sql
-    sql-files/voice_licenses.sql
+    sql-files/voice_chat.sql
 
-Both tables are auto-created via CREATE TABLE IF NOT EXISTS at voice
-server startup, so importing the SQL files is optional.
+It contains all three tables (voice_bans, voice_licenses, voice_blocks).
+All are auto-created via CREATE TABLE IF NOT EXISTS at voice server
+startup, so importing the file is optional.

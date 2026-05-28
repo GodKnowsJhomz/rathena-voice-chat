@@ -24,3 +24,5 @@ void voice_bridge_send_admin_unban_by_name(const char* char_name);
 // Script item paths should refund / refuse to consume when this is false.
 bool voice_bridge_send_grant_license(int account_id, int duration_sec);
 bool voice_bridge_send_revoke_license(int account_id);
+void voice_bridge_send_block_by_name(int blocker_account_id, const char* blocked_name);
+void voice_bridge_send_unblock_by_name(int blocker_account_id, const char* blocked_name);
