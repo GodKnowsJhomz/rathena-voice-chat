@@ -104,6 +104,16 @@ static int parse_kv_file(const char* path,
         std::string val = line.substr(colon + 1);
         trim(key); trim(val);
         if (key.empty()) continue;
+        if (key == "import") {
+            if (!val.empty()) {
+                int sub = parse_kv_file(val.c_str(), handler);
+                if (sub < 0)
+                    printf("[Config] WARNING: import not found: %s\n", val.c_str());
+                else
+                    matched += sub;
+            }
+            continue;
+        }
         try {
             if (handler(key, val)) matched++;
         } catch (...) {
