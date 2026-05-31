@@ -21,6 +21,7 @@
 #  include <arpa/inet.h>
 #  include <fcntl.h>
 #  include <netinet/in.h>
+#  include <netinet/tcp.h>   // TCP_NODELAY
 #  include <sys/socket.h>
 #  include <unistd.h>
 #  define SOCKET int

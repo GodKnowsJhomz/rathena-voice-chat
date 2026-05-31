@@ -208,6 +208,12 @@ void App::accept_loop() {
             continue;
         }
 
+        {
+            int nodelay = 1;
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY,
+                       reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+        }
+
         set_recv_timeout(client, PRE_AUTH_RECV_TIMEOUT_MS);
         void* conn = make_conn_cb_(client, sockaddr_to_ip(from));
         {

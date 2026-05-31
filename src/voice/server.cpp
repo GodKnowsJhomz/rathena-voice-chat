@@ -55,7 +55,7 @@ struct SrvConfig {
     int         max_targets_normal   = 64;
     int         max_targets_group    = 128;
     int         max_targets_room     = 64;
-    int         audio_backpressure_kb = 64;
+    int         audio_backpressure_kb = 128;
     int         speaking_hat_timeout_ms = 900;
     bool        war_mode_enabled     = true;
     bool        war_allow_whisper    = true;
