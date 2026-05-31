@@ -20,6 +20,7 @@
 #include <atomic>
 #include <functional>
 #include <chrono>
+#include <random>
 #ifdef _WIN32
 #  include <windows.h>
 #endif
@@ -79,7 +80,9 @@ struct SrvConfig {
 // the server can still momentarily use a stale position from ~1 tick earlier.
 // Using a small guard keeps practical hearing closer to what the player sees.
 static constexpr float    PROXIMITY_EDGE_GUARD_CELLS = 0.75f;
-static constexpr uint32_t POSITION_STALE_MS          = 2000; // ping every 1s, allow 2s grace
+// Used only as an index-health guard. Proximity itself uses the most recent
+// map_pos as the current truth until a newer map_pos or disconnect arrives.
+static constexpr uint32_t POSITION_STALE_MS          = 10000;
 
 static int parse_kv_file(const char* path,
                          std::function<bool(const std::string&, const std::string&)> handler)
@@ -711,6 +714,16 @@ struct ClientSession {
     uint64_t audio_sent_bytes        = 0;
     uint64_t audio_backpressure_drops = 0;
     uint32_t audio_last_pressure_log = 0;
+    uint64_t udp_token = 0;
+    bool     udp_ready = false;
+    sockaddr_in udp_addr{};
+    uint32_t udp_last_seen_ms = 0;
+    uint64_t udp_sent_packets = 0;
+    uint64_t udp_recv_packets = 0;
+    std::mutex audio_route_mtx;
+    bool     have_rx_seq = false;
+    uint16_t last_rx_seq = 0;
+    uint32_t last_rx_packet_ms = 0;
     std::atomic<bool>     speaking_hat_on{false};
     std::atomic<uint32_t> last_speaking_audio_ms{0};
 
@@ -817,6 +830,19 @@ static std::unordered_map<int, std::unordered_set<int>> g_voice_blocks;
 // Accounts we've already raised a toxic-player alert for (avoid re-alerting
 // on every subsequent block once the threshold is crossed). Cleared on restart.
 static std::unordered_set<int> g_block_alerted;
+
+static uint64_t make_udp_token() {
+    static std::mutex mtx;
+    static std::mt19937_64 rng([] {
+        std::random_device rd;
+        uint64_t seed = (static_cast<uint64_t>(rd()) << 32) ^ rd() ^ tick_ms();
+        return seed;
+    }());
+    std::lock_guard<std::mutex> lock(mtx);
+    uint64_t v = 0;
+    while (v == 0) v = rng();
+    return v;
+}
 
 // ── Pre-built lookup indexes (maintained under g_session_mtx) ────────────────
 // Replaces O(n) full-scan with O(members_in_channel) per audio packet.
@@ -992,11 +1018,23 @@ static uint32_t read_be_u32(const unsigned char* p) {
          |  static_cast<uint32_t>(p[3]);
 }
 
+static uint64_t read_be_u64(const unsigned char* p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v = (v << 8) | static_cast<uint64_t>(p[i]);
+    return v;
+}
+
 static void write_be_u32(unsigned char* p, uint32_t v) {
     p[0] = static_cast<unsigned char>((v >> 24) & 0xFF);
     p[1] = static_cast<unsigned char>((v >> 16) & 0xFF);
     p[2] = static_cast<unsigned char>((v >> 8) & 0xFF);
     p[3] = static_cast<unsigned char>(v & 0xFF);
+}
+
+static void write_be_u64(unsigned char* p, uint64_t v) {
+    for (int i = 7; i >= 0; --i)
+        p[7 - i] = static_cast<unsigned char>((v >> (i * 8)) & 0xFF);
 }
 
 static void write_be_f32(unsigned char* p, float f) {
@@ -1005,23 +1043,12 @@ static void write_be_f32(unsigned char* p, float f) {
     write_be_u32(p, bits);
 }
 
-static bool has_fresh_position(const ClientSession& s) {
-    const uint32_t now = tick_ms();
-    return s.last_position_ms != 0 && (now - s.last_position_ms) <= POSITION_STALE_MS;
-}
-
 static float calc_volume(const ClientSession& from, const ClientSession& to) {
     if (from.map.empty() || to.map.empty() || from.map != to.map)
         return 0.0f;
 
-    if (!has_fresh_position(from) || !has_fresh_position(to)) {
-        LOG_DEBUG("proximity stale-pos  from=%s age=%lu  to=%s age=%lu",
-                  from.char_name.c_str(),
-                  from.last_position_ms ? (unsigned long)(tick_ms() - from.last_position_ms) : 999999UL,
-                  to.char_name.c_str(),
-                  to.last_position_ms ? (unsigned long)(tick_ms() - to.last_position_ms) : 999999UL);
+    if (from.last_position_ms == 0 || to.last_position_ms == 0)
         return 0.0f;
-    }
 
     const int dx = from.x - to.x;
     const int dy = from.y - to.y;
@@ -1217,7 +1244,7 @@ static void kick_session_deferred(int target_char_id,
     });
 }
 
-static constexpr uint32_t NEARBY_BROADCAST_INTERVAL_MS = 1000;
+static constexpr uint32_t NEARBY_BROADCAST_INTERVAL_MS = 100;
 static void send_nearby_players_deferred(ClientSession* s) {
     if (!s || !s->authed || s->map.empty()) return;
 
@@ -2447,6 +2474,19 @@ static void send_json(VoiceSocket* ws, const json& j) {
     ws->send(j.dump(), VoiceTcp::OpCode::TEXT);
 }
 
+static constexpr uint32_t VOICE_UDP_MAGIC = 0x56554450u; // "VUDP"
+static constexpr uint8_t  VOICE_UDP_VERSION = 1;
+static constexpr uint8_t  VOICE_UDP_HELLO = 1;
+static constexpr uint8_t  VOICE_UDP_VOICE = 2;
+static constexpr uint8_t  VOICE_UDP_VOICE_FWD = 3;
+static constexpr size_t   VOICE_UDP_CLIENT_HEADER = 33;
+static constexpr size_t   VOICE_UDP_FWD_PREFIX = 6;
+static constexpr uint32_t VOICE_UDP_ENDPOINT_TTL_MS = 30000;
+
+static SOCKET g_voice_udp_sock = INVALID_SOCKET;
+static std::thread g_voice_udp_thread;
+static std::atomic<bool> g_voice_udp_running{false};
+
 static size_t audio_backpressure_limit_bytes() {
     int kb = g_cfg.audio_backpressure_kb;
     if (kb < 16) kb = 16;
@@ -2513,20 +2553,6 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
     if (!to || !to->ws || pcm_bytes == 0 || volume <= 0.0f)
         return false;
 
-    const size_t pressure_limit = audio_backpressure_limit_bytes();
-    const unsigned int buffered = to->ws->getBufferedAmount();
-    if (buffered > pressure_limit) {
-        to->audio_backpressure_drops++;
-        uint32_t now = tick_ms();
-        if (to->audio_last_pressure_log == 0 || now - to->audio_last_pressure_log > 5000) {
-            to->audio_last_pressure_log = now;
-            LOG_WARNING("audio backpressure drop to char_id=%d buffered=%u limit=%zu drops=%llu",
-                        to->char_id, buffered, pressure_limit,
-                        static_cast<unsigned long long>(to->audio_backpressure_drops));
-        }
-        return false;
-    }
-
     std::string out;
     out.resize(42 + pcm_bytes, '\0');
 
@@ -2541,6 +2567,42 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
     h[41] = static_cast<unsigned char>( seq       & 0xFF);
     std::memcpy(&out[42], pcm, pcm_bytes);
 
+    const uint32_t now = tick_ms();
+    if (g_voice_udp_sock != INVALID_SOCKET && to->udp_ready &&
+        to->udp_last_seen_ms != 0 &&
+        now - to->udp_last_seen_ms <= VOICE_UDP_ENDPOINT_TTL_MS) {
+        std::string udp;
+        udp.resize(VOICE_UDP_FWD_PREFIX + out.size(), '\0');
+        auto* uh = reinterpret_cast<unsigned char*>(&udp[0]);
+        write_be_u32(uh, VOICE_UDP_MAGIC);
+        uh[4] = VOICE_UDP_VERSION;
+        uh[5] = VOICE_UDP_VOICE_FWD;
+        std::memcpy(&udp[VOICE_UDP_FWD_PREFIX], out.data(), out.size());
+
+        int rc = sendto(g_voice_udp_sock, udp.data(), static_cast<int>(udp.size()), 0,
+                        reinterpret_cast<const sockaddr*>(&to->udp_addr),
+                        sizeof(to->udp_addr));
+        if (rc == static_cast<int>(udp.size())) {
+            to->udp_sent_packets++;
+            to->audio_sent_packets++;
+            to->audio_sent_bytes += udp.size();
+            return true;
+        }
+    }
+
+    const size_t pressure_limit = audio_backpressure_limit_bytes();
+    const unsigned int buffered = to->ws->getBufferedAmount();
+    if (buffered > pressure_limit) {
+        to->audio_backpressure_drops++;
+        if (to->audio_last_pressure_log == 0 || now - to->audio_last_pressure_log > 5000) {
+            to->audio_last_pressure_log = now;
+            LOG_WARNING("audio backpressure drop to char_id=%d buffered=%u limit=%zu drops=%llu",
+                        to->char_id, buffered, pressure_limit,
+                        static_cast<unsigned long long>(to->audio_backpressure_drops));
+        }
+        return false;
+    }
+
     auto status = to->ws->send(out, VoiceTcp::OpCode::BINARY);
     if (status != VoiceSocket::SUCCESS) {
         to->audio_backpressure_drops++;
@@ -2550,6 +2612,337 @@ static bool send_audio_to(ClientSession* to, int sender_char_id,
     to->audio_sent_packets++;
     to->audio_sent_bytes += out.size();
     return true;
+}
+
+struct AudioRouteFlood { bool ban = false; int account_id = 0; };
+
+// Core audio routing. The CALLER MUST hold g_session_mtx (shared) for the whole
+// call so that `s` and every target session stay alive while we read/forward.
+// Returns flood info: the g_flood_bans write needs an EXCLUSIVE lock, which the
+// caller applies *after* releasing the shared lock (taking it here would deadlock).
+static AudioRouteFlood route_audio_packet_locked(ClientSession* s, uint8_t channel, uint32_t gid,
+                                                 uint16_t seq, const char* pcm, size_t pcm_bytes) {
+    AudioRouteFlood flood;
+    if (!s || !s->authed || !pcm || pcm_bytes == 0)
+        return flood;
+
+    std::lock_guard<std::mutex> route_lock(s->audio_route_mtx);
+
+    const uint32_t packet_now = tick_ms();
+    if (s->have_rx_seq) {
+        if (s->last_rx_packet_ms != 0 && packet_now - s->last_rx_packet_ms > 500) {
+            s->have_rx_seq = false;
+        } else {
+            const int16_t delta = static_cast<int16_t>(seq - s->last_rx_seq);
+            if (delta <= 0) {
+                LOG_DEBUG("audio duplicate/reorder drop char_id=%d seq=%u last=%u",
+                          s->char_id, static_cast<unsigned>(seq), static_cast<unsigned>(s->last_rx_seq));
+                return flood;
+            }
+        }
+    }
+    s->last_rx_seq = seq;
+    s->have_rx_seq = true;
+    s->last_rx_packet_ms = packet_now;
+
+    if (!s->rate_limit_check()) {
+        LOG_WARNING("rate limit drop char_id=%d violations=%d", s->char_id, s->flood_violations);
+        if (s->is_flooding()) {
+            LOG_ERROR("FLOOD BAN char_id=%d account_id=%d ip=%s — kicking and banning account for 5 min",
+                      s->char_id, s->account_id, s->ip.c_str());
+            // Kick now — `s` is alive under the caller's shared lock. The
+            // g_flood_bans write needs an EXCLUSIVE lock, so defer it to the
+            // caller (return the account_id below).
+            if (s->ws) {
+                send_json(s->ws, json{{"type","flood_banned"},{"duration_ms", FLOOD_BAN_DURATION_MS}});
+                s->ws->end(1008, "flood ban");
+            }
+            flood.ban = true;
+            flood.account_id = s->account_id;
+        }
+        return flood;
+    }
+
+    if (s->muted || s->deafened || !s->ptt) {
+        LOG_DEBUG("audio drop due to tx state char_id=%d muted=%d deafened=%d ptt=%d",
+                  s->char_id, s->muted ? 1 : 0, s->deafened ? 1 : 0, s->ptt ? 1 : 0);
+        return flood;
+    }
+
+    LOG_DEBUG("audio rx char_id=%d ch=%d gid=%u seq=%u opus_bytes=%zu pos=%s(%d,%d) fresh=%d",
+              s->char_id, channel, gid, (unsigned)seq, pcm_bytes,
+              s->map.c_str(), s->x, s->y, s->last_position_ms != 0 ? 1 : 0);
+
+    s->last_speaking_audio_ms.store(tick_ms());
+    set_session_speaking_hat(s, true);
+
+    std::vector<std::pair<ClientSession*, float>> targets;
+    {
+        // Caller already holds g_session_mtx (shared); the channel-index maps
+        // and target sessions below are read under that lock.
+
+        auto collect = [&](const std::unordered_set<ClientSession*>& set) {
+            targets.reserve(targets.size() + set.size());
+            for (ClientSession* to : set) {
+                if (!to) continue;
+                if (!should_forward(channel, gid, *s, *to)) continue;
+                float vol = volume_for(channel, *s, *to);
+                if (vol > 0.0f) targets.push_back({to, vol});
+            }
+        };
+
+        switch (channel) {
+            case 0:
+                for_each_spatial_candidate(*s, [&](ClientSession* to) {
+                    if (!to) return;
+                    if (!should_forward(channel, gid, *s, *to)) return;
+                    float vol = volume_for(channel, *s, *to);
+                    if (vol > 0.0f) targets.push_back({to, vol});
+                });
+                break;
+            case 1:
+                if (s->party_id > 0) {
+                    auto it = g_by_party.find(s->party_id);
+                    if (it != g_by_party.end()) collect(it->second);
+                }
+                break;
+            case 2:
+                if (s->guild_id > 0) {
+                    auto it = g_by_guild.find(s->guild_id);
+                    if (it != g_by_guild.end()) collect(it->second);
+                }
+                break;
+            case 3:
+                if (s->chat_room_id != 0) {
+                    auto it = g_by_room.find(s->chat_room_id);
+                    if (it != g_by_room.end()) collect(it->second);
+                }
+                break;
+            case 4:
+                if (!s->whisper_sid.empty()) {
+                    int peer_id = g_whisper.get_peer(s->whisper_sid, s->char_id);
+                    auto it = g_by_char_id.find(peer_id);
+                    if (it != g_by_char_id.end() && it->second) {
+                        ClientSession* to = it->second;
+                        if (should_forward(channel, gid, *s, *to)) {
+                            float vol = volume_for(channel, *s, *to);
+                            if (vol > 0.0f) targets.push_back({to, vol});
+                        }
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+
+        trim_audio_targets(channel, s->char_id, targets);
+        LOG_DEBUG("audio targets=%zu for char_id=%d", targets.size(), s->char_id);
+
+        size_t sent = 0;
+        for (auto& [to, vol] : targets) {
+            if (send_audio_to(to, s->char_id, s->char_name, vol, s->x, s->y, seq, pcm, pcm_bytes))
+                sent++;
+        }
+        if (sent != targets.size()) {
+            LOG_DEBUG("audio partial fanout char_id=%d targets=%zu sent=%zu dropped=%zu",
+                      s->char_id, targets.size(), sent, targets.size() - sent);
+        }
+    }
+    return flood;
+}
+
+// Apply a flood ban that route_audio_packet_locked deferred (it needs an
+// EXCLUSIVE lock, which cannot be taken while the shared routing lock is held).
+static void apply_deferred_flood_ban(const AudioRouteFlood& flood) {
+    if (!flood.ban) return;
+    std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+    g_flood_bans[flood.account_id] = { tick_ms() + FLOOD_BAN_DURATION_MS };
+}
+
+// TCP entry point. `s` is the calling connection's own user_data (same thread),
+// so it is guaranteed alive; a shared lock keeps the target sessions alive too.
+static void route_audio_packet(ClientSession* s, uint8_t channel, uint32_t gid,
+                               uint16_t seq, const char* pcm, size_t pcm_bytes) {
+    AudioRouteFlood flood;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+        flood = route_audio_packet_locked(s, channel, gid, seq, pcm, pcm_bytes);
+    }
+    apply_deferred_flood_ban(flood);
+}
+
+// UDP entry point. The sender session was looked up cross-thread, so it must be
+// re-found under the shared lock (and the session id re-verified) to guarantee
+// it is still alive before any field is read — the connection thread could have
+// freed it after the UDP receiver released its lock.
+static void route_audio_packet_by_id(int char_id, uint64_t session_id,
+                                     uint8_t channel, uint32_t gid, uint16_t seq,
+                                     const char* pcm, size_t pcm_bytes) {
+    AudioRouteFlood flood;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_session_mtx);
+        auto it = g_by_char_id.find(char_id);
+        if (it == g_by_char_id.end() || !it->second ||
+            it->second->session_id != session_id || !it->second->authed)
+            return;
+        flood = route_audio_packet_locked(it->second, channel, gid, seq, pcm, pcm_bytes);
+    }
+    apply_deferred_flood_ban(flood);
+}
+
+static void voice_udp_send_hello_ack(const sockaddr_in& to) {
+    if (g_voice_udp_sock == INVALID_SOCKET) return;
+    unsigned char packet[6] = {};
+    write_be_u32(packet, VOICE_UDP_MAGIC);
+    packet[4] = VOICE_UDP_VERSION;
+    packet[5] = VOICE_UDP_HELLO;
+    sendto(g_voice_udp_sock, reinterpret_cast<const char*>(packet), sizeof(packet), 0,
+           reinterpret_cast<const sockaddr*>(&to), sizeof(to));
+}
+
+static ClientSession* bind_or_find_udp_session(const unsigned char* p, size_t n,
+                                               const sockaddr_in& from) {
+    if (n < 26) return nullptr;
+    const uint64_t sid = read_be_u64(p + 6);
+    const int char_id = static_cast<int>(read_be_u32(p + 14));
+    const uint64_t token = read_be_u64(p + 18);
+    if (sid == 0 || char_id <= 0 || token == 0) return nullptr;
+
+    auto it = g_by_char_id.find(char_id);
+    if (it == g_by_char_id.end() || !it->second) return nullptr;
+    ClientSession* s = it->second;
+    if (!s->authed || s->session_id != sid || s->udp_token != token)
+        return nullptr;
+
+    s->udp_addr = from;
+    s->udp_ready = true;
+    s->udp_last_seen_ms = tick_ms();
+    return s;
+}
+
+static void voice_udp_loop() {
+    LOG_NOTICE("UDP voice receiver started on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
+    while (g_voice_udp_running.load()) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(g_voice_udp_sock, &readfds);
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000;
+        int ret = select(static_cast<int>(g_voice_udp_sock) + 1, &readfds, nullptr, nullptr, &tv);
+        if (ret <= 0 || !FD_ISSET(g_voice_udp_sock, &readfds))
+            continue;
+
+        unsigned char buf[1600] = {};
+        sockaddr_in from{};
+        socklen_t from_len = sizeof(from);
+        int n = recvfrom(g_voice_udp_sock, reinterpret_cast<char*>(buf), sizeof(buf), 0,
+                         reinterpret_cast<sockaddr*>(&from), &from_len);
+        if (n < 6) continue;
+        if (read_be_u32(buf) != VOICE_UDP_MAGIC || buf[4] != VOICE_UDP_VERSION)
+            continue;
+
+        const uint8_t type = buf[5];
+        if (type == VOICE_UDP_HELLO) {
+            std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+            ClientSession* s = bind_or_find_udp_session(buf, static_cast<size_t>(n), from);
+            if (s) {
+                voice_udp_send_hello_ack(from);
+                LOG_DEBUG("udp hello char_id=%d", s->char_id);
+            }
+            continue;
+        }
+
+        if (type != VOICE_UDP_VOICE || n < static_cast<int>(VOICE_UDP_CLIENT_HEADER + 1))
+            continue;
+
+        int      s_char_id = 0;
+        uint64_t s_sid     = 0;
+        uint16_t seq = 0;
+        uint8_t channel = 0;
+        uint32_t gid = 0;
+        const unsigned char* opus = buf + VOICE_UDP_CLIENT_HEADER;
+        const size_t opus_len = static_cast<size_t>(n) - VOICE_UDP_CLIENT_HEADER;
+        {
+            // Exclusive: bind_or_find updates the session's UDP endpoint.
+            // Capture char_id + session_id so we never deref the raw pointer
+            // after releasing the lock (the session could be freed by its own
+            // connection thread). Routing re-finds it under a shared lock.
+            std::lock_guard<std::shared_mutex> lock(g_session_mtx);
+            ClientSession* s = bind_or_find_udp_session(buf, static_cast<size_t>(n), from);
+            if (!s) continue;
+            s_char_id = s->char_id;
+            s_sid     = s->session_id;
+            seq = static_cast<uint16_t>((buf[26] << 8) | buf[27]);
+            channel = buf[28];
+            gid = read_be_u32(buf + 29);
+            s->udp_recv_packets++;
+        }
+
+        if (channel > 4) {
+            LOG_WARNING("udp audio invalid channel char_id=%d ch=%d (drop)", s_char_id, channel);
+            continue;
+        }
+        if (opus_len > 1500 || !validate_opus_packet(opus, opus_len)) {
+            LOG_WARNING("udp audio invalid opus char_id=%d size=%zu (drop)", s_char_id, opus_len);
+            continue;
+        }
+
+        route_audio_packet_by_id(s_char_id, s_sid, channel, gid, seq,
+                                 reinterpret_cast<const char*>(opus), opus_len);
+    }
+    LOG_NOTICE("UDP voice receiver stopped");
+}
+
+static bool init_voice_udp_receiver() {
+    if (g_voice_udp_sock != INVALID_SOCKET)
+        return true;
+
+    g_voice_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_voice_udp_sock == INVALID_SOCKET) {
+        LOG_WARNING("UDP voice socket create failed");
+        return false;
+    }
+
+    int yes = 1;
+    setsockopt(g_voice_udp_sock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(g_cfg.voice_port));
+    if (g_cfg.voice_ip.empty() || g_cfg.voice_ip == "0.0.0.0" || g_cfg.voice_ip == "*")
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    else
+        inet_pton(AF_INET, g_cfg.voice_ip.c_str(), &addr.sin_addr);
+
+    if (bind(g_voice_udp_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        LOG_WARNING("UDP voice bind failed on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
+        closesocket(g_voice_udp_sock);
+        g_voice_udp_sock = INVALID_SOCKET;
+        return false;
+    }
+
+#ifdef _WIN32
+    u_long nonblock = 1;
+    ioctlsocket(g_voice_udp_sock, FIONBIO, &nonblock);
+#else
+    fcntl(g_voice_udp_sock, F_SETFL, fcntl(g_voice_udp_sock, F_GETFL, 0) | O_NONBLOCK);
+#endif
+
+    g_voice_udp_running.store(true);
+    g_voice_udp_thread = std::thread(voice_udp_loop);
+    return true;
+}
+
+static void stop_voice_udp_receiver() {
+    g_voice_udp_running.store(false);
+    if (g_voice_udp_thread.joinable())
+        g_voice_udp_thread.join();
+    if (g_voice_udp_sock != INVALID_SOCKET) {
+        closesocket(g_voice_udp_sock);
+        g_voice_udp_sock = INVALID_SOCKET;
+    }
 }
 
 void run_server() {
@@ -2607,6 +3000,9 @@ void run_server() {
     // Start UDP receiver for position from Map Server
     if (!init_udp_receiver()) {
         LOG_WARNING("UDP receiver failed to start — positions from Map Server will not work");
+    }
+    if (!init_voice_udp_receiver()) {
+        LOG_WARNING("UDP voice receiver failed to start — clients will fall back to TCP voice");
     }
 
     VoiceTcp::App app;
@@ -2855,7 +3251,13 @@ void run_server() {
                                s->char_id, s->account_id, static_cast<unsigned long long>(s->session_id),
                                s->char_name.c_str(), s->ip.c_str(),
                                s->party_id, s->guild_id, online_snapshot);
-                    send_json(ws, json{{"type", "auth_ok"}});
+                    if (s->udp_token == 0)
+                        s->udp_token = make_udp_token();
+                    send_json(ws, json{
+                        {"type", "auth_ok"},
+                        {"udp_port", g_voice_udp_sock != INVALID_SOCKET ? g_cfg.voice_port : 0},
+                        {"udp_token", s->udp_token}
+                    });
                     // Notify DLL if this account is currently voice-banned,
                     // and (if license mode is on) whether they hold a license.
                     {
@@ -3259,121 +3661,7 @@ void run_server() {
                     return;
                 }
 
-                if (!s->rate_limit_check()) {
-                    LOG_WARNING("rate limit drop char_id=%d violations=%d", s->char_id, s->flood_violations);
-                    if (s->is_flooding()) {
-                        // Sustained flood (~30 consecutive drops) → ban account for 5 min
-                        LOG_ERROR("FLOOD BAN char_id=%d account_id=%d ip=%s — kicking and banning account for 5 min",
-                                  s->char_id, s->account_id, s->ip.c_str());
-                        {
-                            std::lock_guard<std::shared_mutex> lock(g_session_mtx);
-                            g_flood_bans[s->account_id] = { tick_ms() + FLOOD_BAN_DURATION_MS };
-                        }
-                        send_json(ws, json{{"type","flood_banned"},{"duration_ms", FLOOD_BAN_DURATION_MS}});
-                        ws->end(1008, "flood ban");
-                    }
-                    return;
-                }
-
-                // Enforce client-declared TX state on the server too so a buggy
-                // or modified DLL cannot keep relaying voice while locally muted
-                // or after releasing push-to-talk.
-                if (s->muted || s->deafened || !s->ptt) {
-                    LOG_DEBUG("audio drop due to tx state char_id=%d muted=%d deafened=%d ptt=%d",
-                              s->char_id, s->muted ? 1 : 0, s->deafened ? 1 : 0, s->ptt ? 1 : 0);
-                    return;
-                }
-
-                LOG_DEBUG("audio rx char_id=%d ch=%d gid=%u seq=%u opus_bytes=%zu pos=%s(%d,%d) fresh=%d",
-                          s->char_id, channel, gid, (unsigned)seq, pcm_bytes,
-                          s->map.c_str(), s->x, s->y, has_fresh_position(*s) ? 1 : 0);
-
-                s->last_speaking_audio_ms.store(tick_ms());
-                set_session_speaking_hat(s, true);
-
-                // Build target list using pre-built indexes — O(channel_members)
-                // instead of O(all_sessions).  Much faster at 3000+ players.
-                // Uses shared_lock: concurrent audio routing reads don't block
-                // each other, and the UDP writer only briefly stalls them.
-                std::vector<std::pair<ClientSession*, float>> targets;
-                {
-                    std::shared_lock<std::shared_mutex> lock(g_session_mtx); // read-only
-
-                    auto collect = [&](const std::unordered_set<ClientSession*>& set) {
-                        targets.reserve(targets.size() + set.size());
-                        for (ClientSession* to : set) {
-                            if (!to) continue;
-                            if (!should_forward(channel, gid, *s, *to)) continue;
-                            float vol = volume_for(channel, *s, *to);
-                            if (vol > 0.0f) targets.push_back({to, vol});
-                        }
-                    };
-
-                    switch (channel) {
-                        case 0: { // Normal proximity — only same-map players
-                            for_each_spatial_candidate(*s, [&](ClientSession* to) {
-                                if (!to) return;
-                                if (!should_forward(channel, gid, *s, *to)) return;
-                                float vol = volume_for(channel, *s, *to);
-                                if (vol > 0.0f) targets.push_back({to, vol});
-                            });
-                            break;
-                        }
-                        case 1: { // Party
-                            if (s->party_id > 0) {
-                                auto it = g_by_party.find(s->party_id);
-                                if (it != g_by_party.end()) collect(it->second);
-                            }
-                            break;
-                        }
-                        case 2: { // Guild
-                            if (s->guild_id > 0) {
-                                auto it = g_by_guild.find(s->guild_id);
-                                if (it != g_by_guild.end()) collect(it->second);
-                            }
-                            break;
-                        }
-                        case 3: { // Room
-                            if (s->chat_room_id != 0) {
-                                auto it = g_by_room.find(s->chat_room_id);
-                                if (it != g_by_room.end()) collect(it->second);
-                            }
-                            break;
-                        }
-                        case 4: { // Whisper — forward only to the paired peer
-                            if (!s->whisper_sid.empty()) {
-                                int peer_id = g_whisper.get_peer(s->whisper_sid, s->char_id);
-                                auto it = g_by_char_id.find(peer_id);
-                                if (it != g_by_char_id.end() && it->second) {
-                                    ClientSession* to = it->second;
-                                    if (should_forward(channel, gid, *s, *to)) {
-                                        float vol = volume_for(channel, *s, *to);
-                                        if (vol > 0.0f) targets.push_back({to, vol});
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                        default: break;
-                    }
-
-                    // trim + send under the shared_lock so that the raw ClientSession*
-                    // pointers in targets[] remain valid for the duration of send_audio_to.
-                    // If we released the lock first, the close handler could free a session
-                    // between the lock release and the ws->send() call (use-after-free).
-                    trim_audio_targets(channel, s->char_id, targets);
-                    LOG_DEBUG("audio targets=%zu for char_id=%d", targets.size(), s->char_id);
-
-                    size_t sent = 0;
-                    for (auto& [to, vol] : targets) {
-                        if (send_audio_to(to, s->char_id, s->char_name, vol, s->x, s->y, seq, pcm, pcm_bytes))
-                            sent++;
-                    }
-                    if (sent != targets.size()) {
-                        LOG_DEBUG("audio partial fanout char_id=%d targets=%zu sent=%zu dropped=%zu",
-                                  s->char_id, targets.size(), sent, targets.size() - sent);
-                    }
-                }
+                route_audio_packet(s, channel, gid, seq, pcm, pcm_bytes);
                 return;
             }
         },
@@ -3438,6 +3726,7 @@ void run_server() {
         if (token) LOG_STATUS("Listening on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
         else       LOG_ERROR("Failed to listen on %s:%d", g_cfg.voice_ip.c_str(), g_cfg.voice_port);
     }).run();
+    stop_voice_udp_receiver();
     stop_udp_receiver();
     {
         std::lock_guard<std::mutex> lock(g_db_mtx);
