@@ -143,15 +143,11 @@ void App::run() {
     if (accept_thread_.joinable())
         accept_thread_.join();
 
-    std::vector<std::thread> threads;
-    {
-        std::lock_guard<std::mutex> lock(client_mtx_);
-        threads.swap(client_threads_);
-    }
-    for (auto& t : threads) {
-        if (t.joinable())
-            t.join();
-    }
+    // close() already closed every client socket, so the detached worker
+    // threads break out of recv and exit. Wait (bounded) for them to drain
+    // before returning so we don't tear down WSA/statics underneath them.
+    for (int waited = 0; live_client_threads_.load(std::memory_order_relaxed) > 0 && waited < 250; ++waited)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
 
 void App::close() {
@@ -219,8 +215,14 @@ void App::accept_loop() {
         {
             std::lock_guard<std::mutex> lock(client_mtx_);
             active_connections_.push_back(conn);
-            client_threads_.emplace_back([this, conn] { client_loop(conn); });
         }
+        // Detach the worker so its std::thread object isn't retained for the
+        // server's lifetime. The live count lets shutdown wait for drain.
+        live_client_threads_.fetch_add(1, std::memory_order_relaxed);
+        std::thread([this, conn] {
+            client_loop(conn);
+            live_client_threads_.fetch_sub(1, std::memory_order_relaxed);
+        }).detach();
     }
 }
 

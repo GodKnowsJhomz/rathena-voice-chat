@@ -143,7 +143,12 @@ private:
     SOCKET listen_socket_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
     std::thread accept_thread_;
-    std::vector<std::thread> client_threads_;
+    // Per-connection worker threads are DETACHED, not stored: storing them in a
+    // vector that was only joined at shutdown leaked one std::thread object per
+    // connection for the whole server lifetime (handle/memory growth under
+    // normal connect/disconnect churn). We track a live count instead so
+    // shutdown can wait for them to drain.
+    std::atomic<int> live_client_threads_{0};
     std::vector<void*> active_connections_;
     std::mutex client_mtx_;
 
