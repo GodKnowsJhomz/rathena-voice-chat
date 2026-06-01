@@ -3171,8 +3171,18 @@ void run_server() {
                         // (but a different char_id) is a stale ghost — usually
                         // a DLL that forgot to close its previous connection after the
                         // user switched character without restarting the client.
-                        // Kick those before we replace the char_id slot below.
+                        //
+                        // IMPORTANT: only evict ghosts if THIS session is already
+                        // CONFIRMED (a matching map-server advisory arrived = the
+                        // char is really logged into the game). A still-provisional
+                        // session may itself be the ghost — e.g. the same account
+                        // open on two machines with different chars. Letting a
+                        // provisional session kick the real one caused an endless
+                        // reconnect ping-pong (each side kicking the other on
+                        // connect). Provisional sessions whose advisory never
+                        // arrives are removed by the advisory-grace timeout instead.
                         int  stale_account_kicks = 0;
+                        if (!s->awaiting_advisory) {
                         for (auto& kv : g_by_char_id) {
                             ClientSession* other = kv.second;
                             if (!other || other == s) continue;
@@ -3195,6 +3205,7 @@ void run_server() {
                             // session's own .close handler will erase its own
                             // (char_id → session) entry. If we erased here we'd
                             // race with that handler.
+                        }
                         }
                         if (stale_account_kicks > 0) {
                             g_player_count -= stale_account_kicks;
