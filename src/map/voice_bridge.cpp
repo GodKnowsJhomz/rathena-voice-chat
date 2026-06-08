@@ -273,8 +273,9 @@ namespace {
 	// standing players don't lose proximity voice after 2 seconds.
 	static constexpr t_tick KEEPALIVE_MS = 1500;
 
-	// Auth advisory renewal — must be shorter than ADVISORY_GRACE_MS (15 s) so
-	// a reconnecting DLL always finds a fresh advisory within its grace window.
+	// Auth advisory renewal — must be shorter than the voice server's
+	// ADVISORY_GRACE_MS (currently 30 s) so a reconnecting DLL always finds a
+	// fresh advisory within its grace window. 5 s leaves a wide safety margin.
 	static constexpr t_tick AUTH_ADVISORY_RENEW_MS = 5000;
 
 	struct LastPos {

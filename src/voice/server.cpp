@@ -773,6 +773,9 @@ struct PendingPos {
     std::string map;
     int x = 0;
     int y = 0;
+    int level = 0;
+    int job = 0;
+    int group_id = 0;
     bool war_map = false;
     uint32_t ms = 0;
 };
@@ -1598,11 +1601,25 @@ static void udp_position_loop() {
                     }
                 }
 
-                // Expire stale auth advisories (map server should renew every ~30 s)
+                // Expire stale auth advisories (map-server bridge renews every 5 s;
+                // TTL is 2 min so a brief bridge hiccup never drops a live advisory)
                 for (auto it = g_auth_advisories.begin(); it != g_auth_advisories.end(); ) {
                     if (now_maint - it->second.tick > AUTH_ADVISORY_TTL_MS) {
                         LOG_DEBUG("auth_advisory TTL expired char_id=%d", it->first);
                         it = g_auth_advisories.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                // Expire stale replace-flap counters. The close handler clears
+                // these when the holder leaves cleanly, but a counter can linger
+                // if the last contender was bounced (no holder ever closed). Drop
+                // any whose rolling window has long since elapsed so the map can't
+                // grow unbounded across a long uptime.
+                for (auto it = g_replace_flap.begin(); it != g_replace_flap.end(); ) {
+                    if (now_maint - it->second.window_start_tick > FLAP_WINDOW_MS * 2) {
+                        it = g_replace_flap.erase(it);
                     } else {
                         ++it;
                     }
@@ -2337,7 +2354,7 @@ static void udp_position_loop() {
         if (it == g_by_char_id.end() || !it->second) {
             // Session not yet created — cache position for when auth arrives
             LOG_DEBUG("UDP map_pos char_id=%d not in session — cached %s(%d,%d)", char_id, new_map.c_str(), new_x, new_y);
-            g_pending_pos[char_id] = { new_map, new_x, new_y, new_war_map, tick_ms() };
+            g_pending_pos[char_id] = { new_map, new_x, new_y, new_level, new_job, new_gid, new_war_map, tick_ms() };
             continue;
         }
 
@@ -3132,8 +3149,8 @@ void run_server() {
                     }
 
                     // ── Verify against Map Server advisory (anti-spoofing) ────
-                    // Map server broadcasts (char_id, account_id) on login + every
-                    // 30 s. On cold start the DLL's auth can arrive before the
+                    // Map server broadcasts (char_id, account_id) on login + renews
+                    // every 5 s. On cold start the DLL's auth can arrive before the
                     // first UDP advisory packet does; we accept provisionally and
                     // wait up to ADVISORY_GRACE_MS for the advisory. The maintenance
                     // loop kicks sessions whose advisory never arrives. A mismatched
@@ -3208,6 +3225,9 @@ void run_server() {
                             s->map = pp.map;
                             s->x   = pp.x;
                             s->y   = pp.y;
+                            s->level    = pp.level;
+                            s->job      = pp.job;
+                            s->group_id = pp.group_id;
                             s->war_map = pp.war_map;
                             s->last_position_ms = pp.ms;
                             LOG_DEBUG("auth applied pending pos char_id=%d %s(%d,%d)", s->char_id, pp.map.c_str(), pp.x, pp.y);
@@ -3795,8 +3815,16 @@ void run_server() {
                 g_by_ws.erase(ws);
                 if (s->char_id != 0) {
                     auto it = g_by_char_id.find(s->char_id);
-                    if (it != g_by_char_id.end() && it->second == s)
+                    if (it != g_by_char_id.end() && it->second == s) {
                         g_by_char_id.erase(it);
+                        // This session was the *current* holder of the slot (not a
+                        // session that had already been replaced). Its genuine
+                        // departure ends any contention, so clear the flap counter:
+                        // a normal map-change reconnect, or the legit client taking
+                        // over after the rival quit, must start from a clean slate
+                        // and never inherit the rival's strike count.
+                        g_replace_flap.erase(s->char_id);
+                    }
                 }
 
                 if (s->authed)
