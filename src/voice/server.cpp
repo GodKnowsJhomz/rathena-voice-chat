@@ -671,7 +671,10 @@ struct ClientSession {
     // it arrives with a mismatched account_id (real spoof), we kick immediately.
     bool     awaiting_advisory        = false;
     uint32_t advisory_wait_tick       = 0;
-    static constexpr uint32_t ADVISORY_GRACE_MS = 15000;
+    // Doubled from 15 s to absorb map-server tick drift on busy servers
+    // (custom NPC workers, mass logins, autoattack systems) without
+    // false-kicking real players whose advisory was merely delayed.
+    static constexpr uint32_t ADVISORY_GRACE_MS = 30000;
 
     // Set when an auth_revoke deferred-kick has already been scheduled for
     // this session. Double-delivery of auth_revoke (map_quit + map_deliddb)
@@ -806,6 +809,28 @@ struct AuthAdvisory {
 static std::unordered_map<int, AuthAdvisory> g_auth_advisories; // by char_id
 static constexpr uint32_t AUTH_ADVISORY_TTL_MS = 120000; // 2 minutes
 static std::atomic<bool> g_war_active{false};
+
+// ── Duplicate-char replacement flap dampener ─────────────────────────────────
+// Two clients of the SAME account+char (e.g. an autotrade shop running on a
+// VPS plus the player's home client, each behind a different IP) will both
+// pass auth — their account_id matches the map-server advisory — and then
+// fight over the char_id: each new connection replaces the other on every
+// reconnect, flapping many times per second. It is harmless (no leak: every
+// replace calls idx_remove + the close handler's identity guard) but it spams
+// the log and churns CPU/UDP. We can't pick a "true" owner (both are valid for
+// that account), but we CAN stop the thrash: track how often a char_id is
+// replaced; once it exceeds the threshold inside the window, keep whoever
+// currently holds the slot and bounce the newcomer with a long backoff so the
+// connection stabilizes instead of ping-ponging. A genuinely dead holder is
+// still reclaimed once its TCP connection closes (close handler frees the
+// slot), so this never permanently locks out a legitimate client.
+struct ReplaceFlap {
+    uint32_t window_start_tick = 0;
+    int      count             = 0;
+};
+static std::unordered_map<int, ReplaceFlap> g_replace_flap; // by char_id
+static constexpr uint32_t FLAP_WINDOW_MS = 10000; // rolling window
+static constexpr int      FLAP_THRESHOLD = 3;     // replaces in window before damping
 
 // ── Per-account flood-ban list (populated when a client trips FLOOD_VIOLATION_THRESHOLD)
 // Keyed on account_id so families sharing a NAT/router are not collaterally banned.
@@ -2391,6 +2416,20 @@ static bool init_udp_receiver() {
         return false;
     }
 
+    // Boost the kernel UDP receive buffer. The map-server sends one
+    // position ping per online player every second plus a fresh auth
+    // advisory every 5 s; with 200+ players a Linux default rmem (~208 KB)
+    // routinely overflows during login bursts, silently dropping advisories
+    // and triggering "advisory never arrived" kicks on the next 15 s tick.
+    // 4 MB is overkill for steady state but absorbs short bursts cleanly.
+    {
+        int bufsz = 4 * 1024 * 1024;
+        setsockopt(g_udp_sock, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+        setsockopt(g_udp_sock, SOL_SOCKET, SO_SNDBUF,
+                   reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+    }
+
     // Bind to the private map-server bridge/API port.
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -2908,6 +2947,19 @@ static bool init_voice_udp_receiver() {
     setsockopt(g_voice_udp_sock, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&yes), sizeof(yes));
 
+    // Boost RX buffer for the live voice frame port. With ~200 online
+    // players each transmitting opus at ~50 packets/s peak we can see
+    // 10k pkt/s incoming during pile-ups; the default rmem is too small
+    // to absorb that burst and the kernel silently drops frames, which
+    // shows up as choppy/dropped audio rather than disconnects.
+    {
+        int bufsz = 4 * 1024 * 1024;
+        setsockopt(g_voice_udp_sock, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+        setsockopt(g_voice_udp_sock, SOL_SOCKET, SO_SNDBUF,
+                   reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+    }
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(g_cfg.voice_port));
@@ -3139,6 +3191,7 @@ void run_server() {
 
                     s->authed = true;
                     std::vector<SessionKick> sessions_to_close;
+                    bool flap_bounced = false;   // set if the flap dampener refuses this newcomer
                     // Capture initial position to send your_pos after lock is released.
                     // Values may be from pending_pos (position arrived before auth) or
                     // from a prior reconnect (position already on session).
@@ -3216,45 +3269,83 @@ void run_server() {
                         auto it_old = g_by_char_id.find(s->char_id);
                         if (it_old != g_by_char_id.end() && it_old->second && it_old->second != s) {
                             ClientSession* old = it_old->second;
-                            replacing = old->authed; // only counts if old was actually online
-                            LOG_WARNING("duplicate char_id=%d old_session=%llu new_session=%llu — closing old connection",
-                                        s->char_id,
-                                        static_cast<unsigned long long>(old->session_id),
-                                        static_cast<unsigned long long>(s->session_id));
-                            // Mark old session as no longer authed so its close handler
-                            // won't decrement g_player_count (we handle the count here).
-                            old->authed = false;
-                            if (old->ws) {
-                                old->kicking = true;
-                                old->ws->send(json{{"type","error"},{"message","session replaced by new login"}}.dump(),
-                                             VoiceTcp::OpCode::TEXT);
-                                old->ws->end(1000, "replaced");
+
+                            // ── Flap dampener ────────────────────────────────
+                            // Count replacements for this char_id within a rolling
+                            // window. Once we exceed the threshold AND a live holder
+                            // is present, refuse to replace — keep the holder and
+                            // bounce this newcomer instead (handled after the lock).
+                            const uint32_t now_flap = tick_ms();
+                            auto& fl = g_replace_flap[s->char_id];
+                            if (now_flap - fl.window_start_tick > FLAP_WINDOW_MS) {
+                                fl.window_start_tick = now_flap;
+                                fl.count = 0;
                             }
-                            idx_remove(old);
-                        }
-                        g_by_char_id[s->char_id] = s;
 
-                        // Advisory may have arrived during the DB call above (which
-                        // runs without any lock).  If so, confirm the session now so
-                        // the maintenance loop doesn't kick it after ADVISORY_GRACE_MS.
-                        if (s->awaiting_advisory) {
-                            auto ait = g_auth_advisories.find(s->char_id);
-                            if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id) {
-                                s->awaiting_advisory = false;
-                                LOG_DEBUG("auth advisory arrived during DB query — confirmed char_id=%d", s->char_id);
+                            if (old->authed && fl.count >= FLAP_THRESHOLD) {
+                                flap_bounced = true;
+                            } else {
+                                if (old->authed) fl.count++;
+                                replacing = old->authed; // only counts if old was actually online
+                                LOG_WARNING("duplicate char_id=%d old_session=%llu new_session=%llu — closing old connection",
+                                            s->char_id,
+                                            static_cast<unsigned long long>(old->session_id),
+                                            static_cast<unsigned long long>(s->session_id));
+                                // Mark old session as no longer authed so its close handler
+                                // won't decrement g_player_count (we handle the count here).
+                                old->authed = false;
+                                if (old->ws) {
+                                    old->kicking = true;
+                                    old->ws->send(json{{"type","error"},{"message","session replaced by new login"}}.dump(),
+                                                 VoiceTcp::OpCode::TEXT);
+                                    old->ws->end(1000, "replaced");
+                                }
+                                idx_remove(old);
                             }
                         }
 
-                        idx_insert(s);   // add to channel indexes
+                        if (flap_bounced) {
+                            // Do NOT take the slot, index, or player-count. Revert our
+                            // provisional auth and mark kicking so the close handler is
+                            // a no-op. The actual ws->end() happens after the lock.
+                            s->authed  = false;
+                            s->kicking = true;
+                        } else {
+                            g_by_char_id[s->char_id] = s;
 
-                        // If we replaced an existing authed session, count stays the same.
-                        if (!replacing) g_player_count++;
-                        online_snapshot = g_player_count;
+                            // Advisory may have arrived during the DB call above (which
+                            // runs without any lock).  If so, confirm the session now so
+                            // the maintenance loop doesn't kick it after ADVISORY_GRACE_MS.
+                            if (s->awaiting_advisory) {
+                                auto ait = g_auth_advisories.find(s->char_id);
+                                if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id) {
+                                    s->awaiting_advisory = false;
+                                    LOG_DEBUG("auth advisory arrived during DB query — confirmed char_id=%d", s->char_id);
+                                }
+                            }
+
+                            idx_insert(s);   // add to channel indexes
+
+                            // If we replaced an existing authed session, count stays the same.
+                            if (!replacing) g_player_count++;
+                            online_snapshot = g_player_count;
+                        }
                     }
                     for (const auto& kick : sessions_to_close) {
                         kick_session_deferred(kick.char_id, kick.session_id,
                             json{{"type","error"},{"message",kick.reason}},
                             kick.reason);
+                    }
+
+                    // Flap dampener tripped: a live holder already owns this
+                    // char_id and it is being contested too fast. Bounce this
+                    // newcomer with a backoff hint and do NOT proceed to auth_ok.
+                    if (flap_bounced) {
+                        LOG_WARNING("char_id=%d auth bounced — replacement flap dampener active (keeping current holder, ip=%s)",
+                                    s->char_id, s->ip.c_str());
+                        send_json(ws, json{{"type","error"},{"message","session contested"}});
+                        ws->end(1008, "flap dampener");
+                        return;
                     }
 
                     // (g_player_count already updated inside the lock above)

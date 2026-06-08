@@ -354,6 +354,19 @@ void voice_bridge_init() {
 		return;
 	}
 
+	// Boost UDP send/recv buffers. Default Linux rmem/wmem (~208 KB) is
+	// too small for a busy server: with 200+ players the per-second
+	// position pings + 5 s advisory renewals burst beyond the default,
+	// causing kernel drops that look downstream like "auth advisory
+	// never arrived" timeouts. 4 MB absorbs typical bursts cleanly.
+	{
+		int bufsz = 4 * 1024 * 1024;
+		setsockopt(g_sock, SOL_SOCKET, SO_SNDBUF,
+			reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+		setsockopt(g_sock, SOL_SOCKET, SO_RCVBUF,
+			reinterpret_cast<const char*>(&bufsz), sizeof(bufsz));
+	}
+
 #ifdef _WIN32
 	u_long nonblock = 1;
 	ioctlsocket(g_sock, FIONBIO, &nonblock);

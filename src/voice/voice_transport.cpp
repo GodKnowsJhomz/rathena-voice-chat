@@ -189,6 +189,17 @@ static void set_recv_timeout(SOCKET s, int timeout_ms) {
 }
 
 void App::accept_loop() {
+    // Hard cap on concurrent client worker threads. We spawn one std::thread
+    // per accepted TCP connection (see below), and on Linux a flood of
+    // connect-and-drop attempts (broken DLLs, port scanners, even just two
+    // misbehaving clients hammering reconnect) was hitting RLIMIT_NPROC
+    // before old workers could exit. pthread_create then returned EAGAIN,
+    // std::thread's constructor threw std::system_error("Resource temporarily
+    // unavailable"), nothing caught it, and the whole voice-server aborted.
+    // Keep this comfortably below typical ulimit -u (~4096) while still
+    // serving every real player + their reconnect attempts.
+    constexpr int kMaxClientThreads = 8192;
+
     while (running_.load()) {
         sockaddr_in from{};
         socklen_t len = sizeof(from);
@@ -200,6 +211,13 @@ void App::accept_loop() {
         }
 
         if (!make_conn_cb_) {
+            closesocket(client);
+            continue;
+        }
+
+        // Reject if we're already at the thread cap rather than letting
+        // pthread_create fail and crash the process.
+        if (live_client_threads_.load(std::memory_order_relaxed) >= kMaxClientThreads) {
             closesocket(client);
             continue;
         }
@@ -219,10 +237,27 @@ void App::accept_loop() {
         // Detach the worker so its std::thread object isn't retained for the
         // server's lifetime. The live count lets shutdown wait for drain.
         live_client_threads_.fetch_add(1, std::memory_order_relaxed);
-        std::thread([this, conn] {
-            client_loop(conn);
+        try {
+            std::thread([this, conn] {
+                client_loop(conn);
+                live_client_threads_.fetch_sub(1, std::memory_order_relaxed);
+            }).detach();
+        } catch (const std::system_error&) {
+            // pthread_create raced past our cap (or some other resource
+            // exhaustion) — undo bookkeeping and drop the connection
+            // gracefully instead of terminating the whole process.
             live_client_threads_.fetch_sub(1, std::memory_order_relaxed);
-        }).detach();
+            {
+                std::lock_guard<std::mutex> lock(client_mtx_);
+                auto it = std::find(active_connections_.begin(),
+                                    active_connections_.end(), conn);
+                if (it != active_connections_.end())
+                    active_connections_.erase(it);
+            }
+            if (close_conn_cb_)
+                close_conn_cb_(conn);
+            closesocket(client);
+        }
     }
 }
 
