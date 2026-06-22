@@ -2161,6 +2161,8 @@ static void udp_position_loop() {
                 ClientSession* confirm_target = nullptr;
                 int spoof_aid_advisory = 0;
                 int spoof_aid_claimed  = 0;
+                uint32_t spoof_l1_advisory = 0;
+                uint32_t spoof_l1_claimed  = 0;
                 {
                     std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                     auto& adv = g_auth_advisories[cid];
@@ -2187,15 +2189,19 @@ static void udp_position_loop() {
                                 spoof_session_id   = s->session_id;
                                 spoof_aid_advisory = aid;
                                 spoof_aid_claimed  = s->account_id;
+                                spoof_l1_advisory  = l1;
+                                spoof_l1_claimed   = s->login_id1;
                             }
                         } else if (s->account_id != aid || l1_mismatch) {
                             // Already-authed session but advisory says a different
-                            // account_id now owns this char_id → someone else logged
-                            // in as that char (stale session) or a spoof. Kick.
+                            // account_id (or login_id1) now owns this char_id → someone
+                            // else logged in as that char (stale session) or a spoof. Kick.
                             spoof_char_id      = s->char_id;
                             spoof_session_id   = s->session_id;
                             spoof_aid_advisory = aid;
                             spoof_aid_claimed  = s->account_id;
+                            spoof_l1_advisory  = l1;
+                            spoof_l1_claimed   = s->login_id1;
                         }
                     }
                 }
@@ -2207,9 +2213,11 @@ static void udp_position_loop() {
                     int cid_cap = cid;
                     int adv_cap = spoof_aid_advisory;
                     int clm_cap = spoof_aid_claimed;
+                    uint32_t l1adv_cap = spoof_l1_advisory;
+                    uint32_t l1clm_cap = spoof_l1_claimed;
                     int target_char_id = spoof_char_id;
                     uint64_t target_session_id = spoof_session_id;
-                    g_voice_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap]() {
+                    g_voice_loop.load()->defer([target_char_id, target_session_id, cid_cap, adv_cap, clm_cap, l1adv_cap, l1clm_cap]() {
                         {
                             std::lock_guard<std::shared_mutex> lock(g_session_mtx);
                             auto it = g_by_char_id.find(target_char_id);
@@ -2220,8 +2228,16 @@ static void udp_position_loop() {
                                                  VoiceTcp::OpCode::TEXT);
                             it->second->ws->end(1008, "spoof");
                         }
-                        LOG_WARNING("auth SPOOF (late advisory) — char_id=%d claimed aid=%d but advisory aid=%d",
-                                    cid_cap, clm_cap, adv_cap);
+                        // Distinguish the two mismatch causes — same aid with differing
+                        // login_id1 is the "login ซ้อน" (newer login took over) case, not
+                        // an account_id spoof, so don't print identical aids as if it were.
+                        if (clm_cap == adv_cap) {
+                            LOG_WARNING("auth SPOOF (late advisory) — char_id=%d aid=%d login_id1 mismatch claimed=%u advisory=%u",
+                                        cid_cap, clm_cap, l1clm_cap, l1adv_cap);
+                        } else {
+                            LOG_WARNING("auth SPOOF (late advisory) — char_id=%d claimed aid=%d but advisory aid=%d",
+                                        cid_cap, clm_cap, adv_cap);
+                        }
                     });
                 }
             }
