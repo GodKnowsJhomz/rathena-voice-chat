@@ -64,6 +64,7 @@ struct SrvConfig {
     bool        voice_block_bidirectional = false; // A blocks B → neither hears the other
     int         voice_block_alert_threshold = 0;   // distinct blockers to alert GMs (0 = off)
     bool        voice_ignore_sync = false;          // text /ex ignore also blocks voice
+    bool        login_id1_strict  = true;
 
     std::string db_host       = "127.0.0.1";
     int         db_port       = 3306;
@@ -196,6 +197,9 @@ static void load_voice_conf(const char* path) {
         }
         else if (key == "voice_ignore_sync") {
             if (!val.empty()) g_cfg.voice_ignore_sync = (std::stoi(val) != 0); return true;
+        }
+        else if (key == "voice_login_id1_strict") {
+            if (!val.empty()) g_cfg.login_id1_strict = (std::stoi(val) != 0); return true;
         }
         else if (key == "voice_client_secret") {
             g_cfg.client_secret = val; return true;
@@ -2171,7 +2175,8 @@ static void udp_position_loop() {
                     if (sit != g_by_char_id.end() && sit->second) {
                         ClientSession* s = sit->second;
                         const bool l1_mismatch =
-                            (l1 != 0 && s->login_id1 != 0 && l1 != s->login_id1);
+                            (l1 != 0 && l1 != s->login_id1 &&
+                             (g_cfg.login_id1_strict || s->login_id1 != 0));
                         if (s->kicking) {
                         } else if (s->awaiting_advisory) {
                             if (s->account_id == aid && !l1_mismatch) {
@@ -3173,8 +3178,9 @@ void run_server() {
                             LOG_WARNING("auth SPOOF attempt — char_id=%d claimed aid=%d but advisory aid=%d (ip=%s)",
                                         s->char_id, s->account_id, ait->second.account_id, s->ip.c_str());
                             spoof_mismatch = true;
-                        } else if (ait->second.login_id1 != 0 && s->login_id1 != 0 &&
-                                   ait->second.login_id1 != s->login_id1) {
+                        } else if (ait->second.login_id1 != 0 &&
+                                   ait->second.login_id1 != s->login_id1 &&
+                                   (g_cfg.login_id1_strict || s->login_id1 != 0)) {
                             LOG_WARNING("auth SPOOF attempt — char_id=%d aid=%d login_id1 mismatch claimed=%u advisory=%u (ip=%s)",
                                         s->char_id, s->account_id, s->login_id1, ait->second.login_id1, s->ip.c_str());
                             spoof_mismatch = true;
