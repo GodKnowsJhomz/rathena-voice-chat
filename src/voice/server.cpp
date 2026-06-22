@@ -650,6 +650,7 @@ struct ClientSession {
     VoiceSocket* ws = nullptr;
     int account_id = 0;
     int char_id = 0;
+    uint32_t login_id1 = 0;
     std::string char_name;
     std::string ip;
     std::string map;
@@ -2169,9 +2170,11 @@ static void udp_position_loop() {
                     auto sit = g_by_char_id.find(cid);
                     if (sit != g_by_char_id.end() && sit->second) {
                         ClientSession* s = sit->second;
+                        const bool l1_mismatch =
+                            (l1 != 0 && s->login_id1 != 0 && l1 != s->login_id1);
                         if (s->kicking) {
                         } else if (s->awaiting_advisory) {
-                            if (s->account_id == aid) {
+                            if (s->account_id == aid && !l1_mismatch) {
                                 s->awaiting_advisory = false;
                                 confirm_target = s;
                             } else {
@@ -2180,7 +2183,7 @@ static void udp_position_loop() {
                                 spoof_aid_advisory = aid;
                                 spoof_aid_claimed  = s->account_id;
                             }
-                        } else if (s->account_id != aid) {
+                        } else if (s->account_id != aid || l1_mismatch) {
                             // Already-authed session but advisory says a different
                             // account_id now owns this char_id → someone else logged
                             // in as that char (stale session) or a spoof. Kick.
@@ -3129,6 +3132,7 @@ void run_server() {
                     const int      new_aid = j.value("account_id", 0);
                     const int      new_cid = j.value("char_id", 0);
                     const uint64_t new_sid = j.value("session_id", static_cast<uint64_t>(0));
+                    const uint32_t new_l1  = j.value("login_id1", 0u);
 
                     if (s->authed) {
                         LOG_INFO("re-auth on authed session char_id=%d → new char_id=%d — kicking for clean reconnect",
@@ -3142,6 +3146,7 @@ void run_server() {
                     s->account_id = new_aid;
                     s->char_id    = new_cid;
                     s->session_id = new_sid;
+                    s->login_id1  = new_l1;
 
                     if (s->account_id <= 0 || s->char_id <= 0 || s->session_id == 0) {
                         send_json(ws, json{{"type", "error"}, {"message", "missing account_id or char_id"}});
@@ -3167,6 +3172,11 @@ void run_server() {
                         } else if (ait->second.account_id != s->account_id) {
                             LOG_WARNING("auth SPOOF attempt — char_id=%d claimed aid=%d but advisory aid=%d (ip=%s)",
                                         s->char_id, s->account_id, ait->second.account_id, s->ip.c_str());
+                            spoof_mismatch = true;
+                        } else if (ait->second.login_id1 != 0 && s->login_id1 != 0 &&
+                                   ait->second.login_id1 != s->login_id1) {
+                            LOG_WARNING("auth SPOOF attempt — char_id=%d aid=%d login_id1 mismatch claimed=%u advisory=%u (ip=%s)",
+                                        s->char_id, s->account_id, s->login_id1, ait->second.login_id1, s->ip.c_str());
                             spoof_mismatch = true;
                         }
                     }
