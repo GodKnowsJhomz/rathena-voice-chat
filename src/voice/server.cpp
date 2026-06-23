@@ -676,10 +676,8 @@ struct ClientSession {
     // it arrives with a mismatched account_id (real spoof), we kick immediately.
     bool     awaiting_advisory        = false;
     uint32_t advisory_wait_tick       = 0;
-    // Doubled from 15 s to absorb map-server tick drift on busy servers
-    // (custom NPC workers, mass logins, autoattack systems) without
-    // false-kicking real players whose advisory was merely delayed.
-    static constexpr uint32_t ADVISORY_GRACE_MS = 30000;
+    bool     auth_ok_pending          = false;
+    static constexpr uint32_t ADVISORY_GRACE_MS = 90000;
 
     // Set when an auth_revoke deferred-kick has already been scheduled for
     // this session. Double-delivery of auth_revoke (map_quit + map_deliddb)
@@ -1231,6 +1229,8 @@ static bool should_forward(uint8_t channel, uint32_t gid, const ClientSession& f
 
 // Global server loop pointer, set once from the raw TCP server thread before UDP starts.
 static std::atomic<VoiceTcp::Loop*> g_voice_loop{nullptr};
+
+static SOCKET g_voice_udp_sock = INVALID_SOCKET;
 
 // Helper: queue a JSON send onto the server loop (thread-safe).
 // We capture stable session identity (char_id + session_id) instead of a raw
@@ -2184,6 +2184,46 @@ static void udp_position_loop() {
                             if (s->account_id == aid && !l1_mismatch) {
                                 s->awaiting_advisory = false;
                                 confirm_target = s;
+                                if (s->auth_ok_pending) {
+                                    s->auth_ok_pending = false;
+                                    if (s->udp_token == 0) s->udp_token = make_udp_token();
+                                    send_json_deferred(s, json{
+                                        {"type", "auth_ok"},
+                                        {"udp_port", g_voice_udp_sock != INVALID_SOCKET ? g_cfg.voice_port : 0},
+                                        {"udp_token", s->udp_token}});
+                                    auto bit = g_admin_banned.find(s->account_id);
+                                    if (bit != g_admin_banned.end()) {
+                                        const time_t now = time(nullptr);
+                                        if (bit->second == 0 || now < bit->second)
+                                            send_json_deferred(s, json{{"type", "admin_banned"}});
+                                    }
+                                    if (g_cfg.voice_license_required) {
+                                        auto lit = g_voice_licenses.find(s->account_id);
+                                        const bool has = lit != g_voice_licenses.end() &&
+                                                         (lit->second == 0 || time(nullptr) < lit->second);
+                                        if (!has)
+                                            send_json_deferred(s, json{{"type", "license_required"}});
+                                    }
+                                    auto blk = g_voice_blocks.find(s->account_id);
+                                    if (blk != g_voice_blocks.end() && !blk->second.empty()) {
+                                        json arr = json::array();
+                                        for (auto& kv2 : g_by_char_id) {
+                                            ClientSession* o = kv2.second;
+                                            if (!o || !o->authed) continue;
+                                            if (blk->second.count(o->account_id))
+                                                arr.push_back({{"char_id", o->char_id}, {"name", o->char_name}});
+                                        }
+                                        send_json_deferred(s, json{{"type", "your_blocks"}, {"blocked", arr}});
+                                    }
+                                    send_json_deferred(s, make_war_state_json(*s));
+                                    if (!s->map.empty()) {
+                                        send_json_deferred(s, json{
+                                            {"type", "your_pos"}, {"x", s->x}, {"y", s->y}, {"map", s->map}});
+                                        send_nearby_players_deferred(s);
+                                    }
+                                    LOG_NOTICE("(char_id=%d aid=%d name=%s) confirmed via advisory  [online: %d]",
+                                               s->char_id, s->account_id, s->char_name.c_str(), g_player_count);
+                                }
                             } else {
                                 spoof_char_id      = s->char_id;
                                 spoof_session_id   = s->session_id;
@@ -2563,7 +2603,6 @@ static constexpr size_t   VOICE_UDP_CLIENT_HEADER = 33;
 static constexpr size_t   VOICE_UDP_FWD_PREFIX = 6;
 static constexpr uint32_t VOICE_UDP_ENDPOINT_TTL_MS = 30000;
 
-static SOCKET g_voice_udp_sock = INVALID_SOCKET;
 static std::thread g_voice_udp_thread;
 static std::atomic<bool> g_voice_udp_running{false};
 
@@ -3247,6 +3286,7 @@ void run_server() {
                     std::string init_map;
                     int init_x = 0, init_y = 0;
                     int online_snapshot = 0;
+                    bool hold_for_advisory = false;   // decided under the lock below
                     {
                         std::lock_guard<std::shared_mutex> lock(g_session_mtx);
 
@@ -3376,6 +3416,11 @@ void run_server() {
                                 }
                             }
 
+                            if (s->awaiting_advisory) {
+                                s->auth_ok_pending = true;
+                                hold_for_advisory  = true;
+                            }
+
                             idx_insert(s);   // add to channel indexes
 
                             // If we replaced an existing authed session, count stays the same.
@@ -3397,6 +3442,12 @@ void run_server() {
                                     s->char_id, s->ip.c_str());
                         send_json(ws, json{{"type","error"},{"message","session contested"}});
                         ws->end(1008, "flap dampener");
+                        return;
+                    }
+
+                    if (hold_for_advisory) {
+                        LOG_INFO("auth held — waiting for advisory before auth_ok  char_id=%d aid=%d ip=%s",
+                                 s->char_id, s->account_id, s->ip.c_str());
                         return;
                     }
 
