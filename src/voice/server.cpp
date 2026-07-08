@@ -2175,6 +2175,10 @@ static void udp_position_loop() {
 				int spoof_char_id = 0;
 				uint64_t spoof_session_id = 0;
 				ClientSession* confirm_target = nullptr;
+				uint64_t confirm_udp_token = 0;
+				json confirm_war_state;
+				json confirm_pos;
+				bool confirm_has_pos = false;
 				int spoof_aid_advisory = 0;
 				int spoof_aid_claimed = 0;
 				uint32_t spoof_l1_advisory = 0;
@@ -2200,6 +2204,24 @@ static void udp_position_loop() {
 						else if (s->awaiting_advisory) {
 							if (s->account_id == aid && !l1_mismatch) {
 								s->awaiting_advisory = false;
+								if (!s->authed) {
+									s->authed = true;
+									if (s->udp_token == 0)
+										s->udp_token = make_udp_token();
+									idx_insert(s);
+									g_player_count++;
+								}
+								confirm_udp_token = s->udp_token;
+								confirm_war_state = make_war_state_json(*s);
+								if (!s->map.empty()) {
+									confirm_has_pos = true;
+									confirm_pos = json{
+										{"type", "your_pos"},
+										{"x",    s->x},
+										{"y",    s->y},
+										{"map",  s->map}
+									};
+								}
 								confirm_target = s;
 							}
 							else {
@@ -2227,6 +2249,14 @@ static void udp_position_loop() {
 
 				if (confirm_target) {
 					LOG_INFO("auth confirmed via late advisory  char_id=%d aid=%d", cid, aid);
+					send_json_deferred(confirm_target, json{
+						{"type", "auth_ok"},
+						{"udp_port", g_cfg.voice_port},
+						{"udp_token", confirm_udp_token}
+					});
+					send_json_deferred(confirm_target, confirm_war_state);
+					if (confirm_has_pos)
+						send_json_deferred(confirm_target, confirm_pos);
 				}
 				if (spoof_char_id > 0 && g_voice_loop.load()) {
 					int cid_cap = cid;
@@ -3225,14 +3255,12 @@ if (type == "auth") {
 	// loop kicks sessions whose advisory never arrives. A mismatched
 	// advisory on arrival still causes an immediate kick.
 	bool spoof_mismatch = false;
-	bool missing_advisory = false;
 	{
 		std::shared_lock<std::shared_mutex> lock(g_session_mtx);
 		auto ait = g_auth_advisories.find(s->char_id);
 		if (ait == g_auth_advisories.end()) {
 			s->awaiting_advisory = true;
 			s->advisory_wait_tick = tick_ms();
-			missing_advisory = true;
 			LOG_INFO("auth provisional — waiting for advisory  char_id=%d ip=%s (grace %ums)",
 					 s->char_id, s->ip.c_str(), ClientSession::ADVISORY_GRACE_MS);
 		}
@@ -3248,11 +3276,6 @@ else if (ait->second.login_id1 != 0 &&
 			 s->char_id, s->account_id, s->login_id1, ait->second.login_id1, s->ip.c_str());
  spoof_mismatch = true;
 }
-}
-if (missing_advisory) {
-	send_json(ws, json{{"type","error"},{"message","no active map session"}});
-	ws->end(1008, "no advisory");
-	return;
 }
 if (spoof_mismatch) {
 	send_json(ws, json{{"type","error"},{"message","credentials mismatch"}});
@@ -3290,7 +3313,7 @@ s->db_refresh_tick = time(nullptr);
 	}
 }
 
-s->authed = true;
+s->authed = !s->awaiting_advisory;
 std::vector<SessionKick> sessions_to_close;
 bool flap_bounced = false;   // set if the flap dampener refuses this newcomer
 // Capture initial position to send your_pos after lock is released.
@@ -3442,14 +3465,16 @@ else {
 	 auto ait = g_auth_advisories.find(s->char_id);
 	 if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id) {
 		 s->awaiting_advisory = false;
+		 s->authed = true;
 		 LOG_DEBUG("auth advisory arrived during DB query — confirmed char_id=%d", s->char_id);
 	 }
  }
 
- idx_insert(s);   // add to channel indexes
+ if (s->authed)
+	 idx_insert(s);   // add to channel indexes
 
  // If we replaced an existing authed session, count stays the same.
- if (!replacing) g_player_count++;
+ if (s->authed && !replacing) g_player_count++;
  online_snapshot = g_player_count;
 }
 }
@@ -3467,6 +3492,12 @@ if (flap_bounced) {
 				s->char_id, s->ip.c_str());
 	send_json(ws, json{{"type","error"},{"message","session contested"}});
 	ws->end(1008, "flap dampener");
+	return;
+}
+
+if (s->awaiting_advisory) {
+	LOG_INFO("auth provisional accepted  char_id=%d aid=%d sid=%llu — waiting for late advisory",
+			   s->char_id, s->account_id, static_cast<unsigned long long>(s->session_id));
 	return;
 }
 
