@@ -61,6 +61,7 @@ struct SrvConfig {
 	bool        war_mode_enabled = true;
 	bool        war_allow_whisper = true;
 	bool        voice_license_required = false; // gate audio TX behind a voice_licenses entry
+	bool        voice_vip_required = false;     // only rAthena-VIP players may use voice at all
 	bool        voice_block_bidirectional = false; // A blocks B → neither hears the other
 	int         voice_block_alert_threshold = 0;   // distinct blockers to alert GMs (0 = off)
 	bool        voice_ignore_sync = false;          // text /ex ignore also blocks voice
@@ -189,6 +190,9 @@ static void load_voice_conf(const char* path) {
 		}
 		else if (key == "voice_license_required") {
 			if (!val.empty()) g_cfg.voice_license_required = (std::stoi(val) != 0); return true;
+		}
+		else if (key == "voice_vip_required") {
+			if (!val.empty()) g_cfg.voice_vip_required = (std::stoi(val) != 0); return true;
 		}
 		else if (key == "voice_block_bidirectional") {
 			if (!val.empty()) g_cfg.voice_block_bidirectional = (std::stoi(val) != 0); return true;
@@ -815,6 +819,7 @@ static int g_player_count = 0;
 struct AuthAdvisory {
 	int      account_id = 0;
 	uint32_t login_id1 = 0;   // optional: RO session token, for future stricter check
+	bool     vip = false;     // rAthena VIP status (sd->vip.enabled) at last refresh
 	uint32_t tick = 0;   // tick_ms() of last refresh
 };
 static std::unordered_map<int, AuthAdvisory> g_auth_advisories; // by char_id
@@ -2188,8 +2193,9 @@ static void udp_position_loop() {
 					auto& adv = g_auth_advisories[cid];
 					adv.account_id = aid;
 					adv.login_id1 = l1;
+					adv.vip = j.value("vip", false);
 					adv.tick = tick_ms();
-					LOG_DEBUG("auth_advisory char_id=%d account_id=%d l1=%u", cid, aid, l1);
+					LOG_DEBUG("auth_advisory char_id=%d account_id=%d l1=%u vip=%d", cid, aid, l1, (int)adv.vip);
 
 					// If there's a provisional session waiting for this advisory,
 					// either confirm it (matching account_id) or flag it as spoof.
@@ -2202,7 +2208,14 @@ static void udp_position_loop() {
 						if (s->kicking) {
 						}
 						else if (s->awaiting_advisory) {
-							if (s->account_id == aid && !l1_mismatch) {
+							if (s->account_id == aid && !l1_mismatch &&
+								g_cfg.voice_vip_required && !adv.vip) {
+								// Credentials OK but not VIP yet — HOLD (stay provisional,
+								// bar hidden). Don't confirm and don't kick: if this VIP's
+								// flag flips true on a later advisory it confirms then; a
+								// real non-VIP just stays held until the grace timeout.
+							}
+							else if (s->account_id == aid && !l1_mismatch) {
 								s->awaiting_advisory = false;
 								if (!s->authed) {
 									s->authed = true;
@@ -3276,6 +3289,15 @@ else if (ait->second.login_id1 != 0 &&
 			 s->char_id, s->account_id, s->login_id1, ait->second.login_id1, s->ip.c_str());
  spoof_mismatch = true;
 }
+else if (g_cfg.voice_vip_required && !ait->second.vip) {
+ // Credentials match but the advisory says this player is NOT VIP (voice is
+ // VIP-only). Do NOT reject — HOLD like a provisional auth: a VIP whose vip flag
+ // lands a moment late (advisory sent at map-join before VIP finished loading)
+ // will confirm on the next advisory renewal instead of being falsely rejected.
+ // A genuinely non-VIP session simply stays held (auth_ok never sent → no bar).
+ s->awaiting_advisory  = true;
+ s->advisory_wait_tick = tick_ms();
+}
 }
 if (spoof_mismatch) {
 	send_json(ws, json{{"type","error"},{"message","credentials mismatch"}});
@@ -3463,7 +3485,7 @@ else {
  // the maintenance loop doesn't kick it after ADVISORY_GRACE_MS.
  if (s->awaiting_advisory) {
 	 auto ait = g_auth_advisories.find(s->char_id);
-	 if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id) {
+	 if (ait != g_auth_advisories.end() && ait->second.account_id == s->account_id && (!g_cfg.voice_vip_required || ait->second.vip)) {
 		 s->awaiting_advisory = false;
 		 s->authed = true;
 		 LOG_DEBUG("auth advisory arrived during DB query — confirmed char_id=%d", s->char_id);

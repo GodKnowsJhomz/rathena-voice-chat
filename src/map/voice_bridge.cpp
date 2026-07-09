@@ -441,15 +441,27 @@ static void voice_bridge_send_pos_common(map_session_data* sd) {
 static void voice_bridge_send_auth_advisory_internal(map_session_data* sd) {
 	if (!g_ready || !sd) return;
 
-	char buf[160];
+	char buf[192];
 	std::snprintf(
 		buf, sizeof(buf),
-		"{\"type\":\"auth_advisory\",\"char_id\":%d,\"account_id\":%d,\"login_id1\":%u}",
+		"{\"type\":\"auth_advisory\",\"char_id\":%d,\"account_id\":%d,\"login_id1\":%u,\"vip\":%s}",
 		sd->status.char_id,
 		sd->status.account_id,
-		(unsigned int)sd->login_id1
+		(unsigned int)sd->login_id1,
+		// Voice VIP-gate flag = real VIP OR a GM (group level >= 99). GMs can't be
+		// VIP, so we let them through the VIP-only gate. The voice server just reads
+		// this "vip" flag, so no server-side change is needed.
+		(pc_isvip(sd) || pc_get_group_level(sd) >= 99) ? "true" : "false"
 	);
 	voice_bridge_send_text(buf);
+}
+
+// Public: re-send the auth advisory on demand. Called when VIP status is resolved
+// (the VIP info arrives async AFTER map-join, so the join advisory would carry the
+// pre-ack vip=false); this pushes the corrected vip so the voice server confirms a
+// held VIP session immediately instead of waiting for the 5 s renewal.
+void voice_bridge_send_auth_advisory(map_session_data* sd) {
+	voice_bridge_send_auth_advisory_internal(sd);
 }
 
 void voice_bridge_send_join(map_session_data* sd) {

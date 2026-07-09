@@ -31,6 +31,7 @@
 #include "pc_groups.hpp"
 #include "pet.hpp"
 #include "script.hpp" // script_config
+#include "voice_bridge.hpp"
 #include "storage.hpp"
 
 static TIMER_FUNC(check_connect_char_server);
@@ -1582,6 +1583,14 @@ void chrif_parse_ack_vipActive(int32 fd) {
 			clif_displaymessage(sd->fd,msg_txt(sd,438)); // You are no longer VIP.
 		}
 	}
+
+	// Voice: VIP info resolves ASYNC (this ack arrives after map-join, so the join
+	// advisory carried vip=false). Re-push the advisory with the corrected VIP so
+	// the voice server's VIP gate confirms a held VIP session immediately instead
+	// of waiting for the 5 s advisory renewal.
+	if (changed)
+		voice_bridge_send_auth_advisory(sd);
+
 	// Show info if status changed
 	if (((flag&0x4) || changed) && !sd->vip.disableshowrate) {
 		clif_display_pinfo( *sd );
